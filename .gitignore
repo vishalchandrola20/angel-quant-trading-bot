@@ -1,0 +1,39 @@
+# ✅ Python virtual environment
+.venv/
+venv/
+
+# ✅ Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ✅ IntelliJ IDEA / JetBrains project files
+.idea/
+*.iml
+
+# ✅ VSCode (if ever used)
+.vscode/
+
+# ✅ Sensitive files (Do NOT commit)
+config/credentials.yaml
+
+# ✅ Logs & data files
+data/
+logs/
+*.log
+
+# ✅ Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# ✅ Environment variables file (future)
+.env
+.env.*
+
+# ✅ Mac system files
+.DS_Store
+
+# ✅ Build / packaging
+build/
+dist/
+*.egg-info/
