@@ -123,6 +123,30 @@ class AngelAPI:
             },
         ]
 
+    def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str | int) -> float:
+        """
+        Fetch LTP using SmartAPI ltpData for a single instrument.
+        Returns the last traded price as float.
+        """
+        if self.mock or self.connection is None:
+            raise RuntimeError("AngelAPI is in MOCK mode or not logged in; cannot fetch real LTP.")
+
+        resp = self.connection.ltpData(
+            exchange=exchange,
+            tradingsymbol=tradingsymbol,
+            symboltoken=str(symboltoken),
+        )
+        # Expected format (simplified):
+        # {"status": True, "data": {"ltp": 123.45, ...}, ...}
+        data = resp.get("data") or {}
+        ltp = data.get("ltp")
+        if ltp is None:
+            raise RuntimeError(f"No LTP in response for {tradingsymbol} / {symboltoken}: {resp}")
+        return float(ltp)
+
+
+
+
 
 if __name__ == "__main__":
     api = AngelAPI()
