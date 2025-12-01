@@ -6,7 +6,7 @@ import sys
 
 
 def plot_vwap_for_day(trading_date: str):
-    csv_path = Path("data/processed") / f"vwap_backtest_{trading_date}.csv"
+    csv_path = Path("data/processed/strangle") / f"vwap_backtest_{trading_date}.csv"
     if not csv_path.exists():
         print(f"CSV not found: {csv_path}")
         sys.exit(1)

@@ -120,9 +120,9 @@ def _fetch_intraday_bars_for_ce_pe(
     return bars, ce_contract.symbol, pe_contract.symbol
 
 
-def run_vwap_ce_pe_strategy_for_day(
+def run_vwap_strangle_strategy_for_day(
         trading_date: date,
-        bar_interval: str = "TEN_SECOND",  # switched to 1-min
+        bar_interval: str = "ONE_MINUTE",  # switched to 1-min
         expiry_str: str | None = None,
         stop_loss_pct: float = 0.70,       # 70% SL
         export_csv: bool = True,
@@ -279,7 +279,7 @@ def run_vwap_ce_pe_strategy_for_day(
 
     # 6) Export CSV for plotting
     if export_csv:
-        out_dir = Path("data/processed")
+        out_dir = Path("data/processed/strangle")
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"vwap_backtest_{trading_date}.csv"
 

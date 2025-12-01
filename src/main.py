@@ -5,7 +5,7 @@ from src.data_pipeline.option_chain import fetch_and_save
 from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
 from src.strategy.strike_selection import get_single_ce_pe_strikes
 from datetime import datetime
-from src.backtest.vwap_ce_pe_strategy import run_vwap_ce_pe_strategy_for_day
+from src.backtest.vwap_ce_pe_strategy import run_vwap_strangle_strategy_for_day
 
 
 from src.market.ltp_stream import (
@@ -75,7 +75,7 @@ def main():
         trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
         expiry_str = args.expiry or None  # if None -> auto-select next available expiry
 
-        run_vwap_ce_pe_strategy_for_day(
+        run_vwap_strangle_strategy_for_day(
             trading_date=trading_date,
             bar_interval="ONE_MINUTE",
             expiry_str=expiry_str,
