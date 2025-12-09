@@ -6,6 +6,8 @@ from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
 from src.strategy.strike_selection import get_single_ce_pe_strikes
 from datetime import datetime
 from src.backtest.vwap_ce_pe_strategy import run_vwap_strangle_strategy_for_day
+from src.backtest.vwap_straddle_strategy import run_vwap_straddle_strategy_for_day
+
 
 
 from src.market.ltp_stream import (
@@ -25,7 +27,8 @@ def main():
             "nifty_first_15m_strikes",
             "stream_ce_pe_ltp",
             "backtest_ce_pe_intraday",
-            "backtest_vwap_strategy",
+            "backtest_vwap_strangle",
+            "backtest_vwap_straddle",
         ],
         default="option_chain",
     )
@@ -67,9 +70,9 @@ def main():
         # expiry optional: if provided, we backtest that exact expiry; if not, auto-pick
         expiry_str = args.expiry or None
 
-        backtest_ce_pe_intraday_for_day(trading_date, bar_interval="ONE_MINUTE",expiry_str=expiry_str)
+        backtest_ce_pe_intraday_for_day(trading_date, bar_interval="FIVE_MINUTE",expiry_str=expiry_str)
 
-    elif args.task == "backtest_vwap_strategy":
+    elif args.task == "backtest_vwap_strangle":
         if not args.date:
             raise SystemExit("--date is required for backtest_vwap_strategy")
         trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
@@ -81,6 +84,21 @@ def main():
             expiry_str=expiry_str,
             stop_loss_pct=0.70,
         )
+
+    elif args.task == "backtest_vwap_straddle":
+        if not args.date:
+            raise SystemExit("--date is required for backtest_vwap_straddle")
+        trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+        expiry_str = args.expiry or None
+
+        run_vwap_straddle_strategy_for_day(
+            trading_date=trading_date,
+            bar_interval="ONE_MINUTE",
+            expiry_str=expiry_str,
+            stop_loss_pct=0.70,
+            export_csv=True,
+    )
+
 
 
 

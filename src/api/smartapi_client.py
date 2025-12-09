@@ -9,6 +9,7 @@ import os
 import yaml
 import pyotp
 import logging
+import uuid
 
 try:
     from SmartApi import SmartConnect
@@ -73,55 +74,82 @@ class AngelAPI:
             self.mock = True
             return False
 
-    # Example wrapper for future SmartAPI calls
-    def get_option_chain(self, symbol="NIFTY"):
+    def place_order(
+        self,
+        tradingsymbol: str,
+        symbol_token: str,
+        quantity: int,
+        transaction_type: str,
+        order_type: str = "MARKET",
+        product_type: str = "INTRADAY",
+        exchange: str = "NFO",
+    ) -> str:
         """
-        Try to fetch option chain via SmartAPI wrapper.
-        NOTE: The exact method/endpoint depends on SmartAPI SDK version.
-        If the SDK has a specific helper method, replace the call below.
-        If running in mock mode, returns sample data.
+        Places an order and returns the order ID.
+        Raises a RuntimeError if the order placement fails.
         """
         if self.mock:
-            log.info("Returning MOCK option chain data.")
-            return self._mock_option_chain(symbol)
+            order_id = str(uuid.uuid4())
+            log.info(f"MOCK order placed for {tradingsymbol}. MOCK order ID: {order_id}")
+            return order_id
 
-        # Replace the following with the correct SmartAPI method if available.
-        # Many SDKs expose a method to fetch option chains; if not, you can
-        # use connection.getData or connection.get('...') to call REST endpoints.
+        order_params = {
+            "variety": "NORMAL",
+            "tradingsymbol": tradingsymbol,
+            "symboltoken": symbol_token,
+            "transactiontype": transaction_type,
+            "exchange": exchange,
+            "ordertype": order_type,
+            "producttype": product_type,
+            "duration": "DAY",
+            "quantity": quantity,
+        }
+        
+        response = self.connection.placeOrder(order_params)
+        
+        if response and response.get("status") and response.get("data", {}).get("orderid"):
+            order_id = response["data"]["orderid"]
+            log.info(f"Successfully placed order for {tradingsymbol}. Order ID: {order_id}")
+            return order_id
+        else:
+            error_msg = response.get("message", "Unknown error")
+            raise RuntimeError(f"Order placement failed for {tradingsymbol}: {error_msg}")
+
+    def get_order_book(self) -> list[dict] | None:
+        """
+        Fetches the entire order book for the day.
+        """
+        if self.mock:
+            log.info("MOCK get_order_book returning empty list.")
+            return []
+        
         try:
-            # example: if SDK exposes get_option_chain - this is a placeholder
-            if hasattr(self.connection, "getOptionChain"):
-                return self.connection.getOptionChain({"symbol": symbol})
-            # fallback: try a generic 'get_option_chain' name
-            if hasattr(self.connection, "get_option_chain"):
-                return self.connection.get_option_chain(symbol)
-            # If neither exists, raise to go to fallback message below.
-            raise AttributeError("SmartAPI client has no get_option_chain method")
+            response = self.connection.orderBook()
+            if response and response.get("status"):
+                return response.get("data")
+            else:
+                log.error(f"Failed to fetch order book: {response.get('message', 'Unknown error')}")
+                return None
         except Exception as e:
-            log.exception("Could not get option chain from SmartAPI. Returning MOCK data.")
-            self.mock = True
-            return self._mock_option_chain(symbol)
+            log.exception("Exception while fetching order book.")
+            return None
 
-    @staticmethod
-    def _mock_option_chain(symbol):
+    def get_order_status(self, order_id: str) -> dict | None:
         """
-        Return a tiny example option chain as a list of dicts.
-        This is intentionally small — used only so other code can run locally.
+        Fetches the status and details of a specific order by its ID.
+        Returns the order details dictionary if found, otherwise None.
         """
-        return [
-            {
-                "strikePrice": 22000,
-                "expiryDate": "2025-11-27",
-                "CE": {"lastPrice": 120.5, "openInterest": 25000, "impliedVolatility": 14.2},
-                "PE": {"lastPrice": 110.0, "openInterest": 27000, "impliedVolatility": 13.8},
-            },
-            {
-                "strikePrice": 22100,
-                "expiryDate": "2025-11-27",
-                "CE": {"lastPrice": 95.75, "openInterest": 18000, "impliedVolatility": 14.0},
-                "PE": {"lastPrice": 130.25, "openInterest": 22000, "impliedVolatility": 14.5},
-            },
-        ]
+        if self.mock:
+            # Simulate a completed order for testing purposes
+            log.info(f"MOCK get_order_status for {order_id}")
+            return {"status": "complete", "averageprice": 100.0, "filledshares": 50, "orderid": order_id}
+
+        order_book = self.get_order_book()
+        if order_book:
+            for order in order_book:
+                if order.get("orderid") == order_id:
+                    return order
+        return None
 
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str | int) -> float:
         """
@@ -144,12 +172,22 @@ class AngelAPI:
             raise RuntimeError(f"No LTP in response for {tradingsymbol} / {symboltoken}: {resp}")
         return float(ltp)
 
-
-
-
-
 if __name__ == "__main__":
     api = AngelAPI()
     api.login()
-    oc = api.get_option_chain("NIFTY")
-    print(oc)
+    if not api.mock:
+        try:
+            # This is an example and will need a valid symbol and token
+            # For testing, you might need to fetch a valid contract first
+            # order_id = api.place_order("NIFTY...", "...", 50, "BUY")
+            # time.sleep(1)
+            # status = api.get_order_status(order_id)
+            # print("Order Status:", status)
+            
+            order_book = api.get_order_book()
+            print("Order Book:", order_book)
+
+        except Exception as e:
+            print(e)
+    else:
+        print("Running in MOCK mode. Cannot place real orders.")

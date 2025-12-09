@@ -1,11 +1,11 @@
-# scripts/plot_vwap_day.py
+# scripts/plot_vwap_strangle_day.py
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
 
 
-def plot_vwap_for_day(trading_date: str):
+def plot_vwap_strangle_for_day(trading_date: str):
     csv_path = Path("data/processed/strangle") / f"vwap_backtest_{trading_date}.csv"
     if not csv_path.exists():
         print(f"CSV not found: {csv_path}")
@@ -38,7 +38,7 @@ def plot_vwap_for_day(trading_date: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python scripts/plot_vwap_day.py YYYY-MM-DD")
+        print("Usage: python scripts/plot_vwap_strangle_day.py YYYY-MM-DD")
         sys.exit(1)
 
-    plot_vwap_for_day(sys.argv[1])
+    plot_vwap_strangle_for_day(sys.argv[1])

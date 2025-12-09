@@ -1,3 +1,4 @@
+# scripts/analyze_straddle_results.py
 from __future__ import annotations
 
 import sys
@@ -5,14 +6,13 @@ from pathlib import Path
 
 import pandas as pd
 
-
-STRANGLE_DIR = Path("data/processed/strangle")
-OUT_PATH = Path("data/processed/strangle_summary.csv")
+STRADDLE_DIR = Path("data/processed/straddle")
+OUT_PATH = Path("data/processed/straddle_summary.csv")
 
 
 def analyze_single_day(csv_path: Path) -> dict | None:
     """
-    Reads one strangle CSV and returns a summary dict:
+    Reads one straddle CSV and returns a summary dict:
     - date
     - entry_time, exit_time
     - exit_reason
@@ -29,7 +29,7 @@ def analyze_single_day(csv_path: Path) -> dict | None:
     # parse timestamps
     df["ts"] = pd.to_datetime(df["ts"])
 
-    # determine trading date as date of first bar
+    # determine trading date from the data
     trading_date = df["ts"].dt.date.iloc[0]
 
     # find entry & exit rows
@@ -77,20 +77,14 @@ def analyze_single_day(csv_path: Path) -> dict | None:
     trade_slice["ce_close"] = trade_slice["ce_close"].astype(float)
     trade_slice["pe_close"] = trade_slice["pe_close"].astype(float)
 
-    # mark-to-market per bar for the combined short strangle
+    # mark-to-market per bar for the combined short straddle
     # P&L per bar = (entry_ce - current_ce) + (entry_pe - current_pe)
     trade_slice["pnl_ce_bar"] = entry_ce - trade_slice["ce_close"]
     trade_slice["pnl_pe_bar"] = entry_pe - trade_slice["pe_close"]
     trade_slice["total_pnl_bar"] = trade_slice["pnl_ce_bar"] + trade_slice["pnl_pe_bar"]
 
-    max_profit_row = trade_slice.loc[trade_slice["total_pnl_bar"].idxmax()]
-    max_profit_time = max_profit_row["ts"]
-    max_profit = max_profit_row["total_pnl_bar"]
+    max_profit = trade_slice["total_pnl_bar"].max()   # best M2M
     max_loss = trade_slice["total_pnl_bar"].min()     # worst M2M (likely negative)
-
-    # optional: infer symbols if present in CSV
-    ce_symbol = df.columns[df.columns.str.lower().str.contains("ce_symbol")].tolist()
-    pe_symbol = df.columns[df.columns.str.lower().str.contains("pe_symbol")].tolist()
 
     summary = {
         "date": trading_date,
@@ -106,7 +100,6 @@ def analyze_single_day(csv_path: Path) -> dict | None:
         "pnl_pe": pnl_pe,
         "total_pnl": total_pnl,
         "max_profit_during_trade": max_profit,
-        "max_profit_time_during_trade": max_profit_time,
         "max_loss_during_trade": max_loss,
     }
 
@@ -114,16 +107,16 @@ def analyze_single_day(csv_path: Path) -> dict | None:
 
 
 def main():
-    if not STRANGLE_DIR.exists():
-        print(f"Strangle folder not found: {STRANGLE_DIR}")
+    if not STRADDLE_DIR.exists():
+        print(f"Straddle folder not found: {STRADDLE_DIR}")
         sys.exit(1)
 
-    csv_files = sorted(STRANGLE_DIR.glob("*.csv"))
+    csv_files = sorted(STRADDLE_DIR.glob("*.csv"))
     if not csv_files:
-        print(f"No CSV files found in {STRANGLE_DIR}")
+        print(f"No CSV files found in {STRADDLE_DIR}")
         sys.exit(0)
 
-    print(f"Found {len(csv_files)} strangle CSVs under {STRANGLE_DIR}")
+    print(f"Found {len(csv_files)} straddle CSVs under {STRADDLE_DIR}")
 
     summaries = []
     for csv_path in csv_files:
@@ -147,8 +140,8 @@ def main():
     max_day_loss = summary_df["total_pnl"].min()
     win_rate = (summary_df["total_pnl"] > 0).mean() * 100.0
 
-    print("\n=== Strangle Strategy Summary ===")
-    print(summary_df[["date", "total_pnl", "max_profit_during_trade", "max_profit_time_during_trade", "max_loss_during_trade",
+    print("\n=== Straddle Strategy Summary ===")
+    print(summary_df[["date", "total_pnl", "max_profit_during_trade", "max_loss_during_trade",
                       "entry_time", "exit_time", "exit_reason"]])
 
     print("\n=== Aggregate Stats ===")
