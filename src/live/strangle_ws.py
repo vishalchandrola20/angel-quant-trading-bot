@@ -46,7 +46,7 @@ except Exception as e:
 
 
 class StrangleLive:
-    NIFTY_LOT_SIZE = 50
+    NIFTY_LOT_SIZE = 75
 
     def __init__(
             self,
@@ -110,16 +110,71 @@ class StrangleLive:
 
         log.info("event=%s | %s", event, details)
 
+    def _get_historical_candles(self, contract: OptionContract, from_dt: datetime, to_dt: datetime) -> list:
+        """Helper to fetch historical 1-minute candles."""
+        from_str = from_dt.strftime("%Y-%m-%d %H:%M")
+        to_str = to_dt.strftime("%Y-%m-%d %H:%M")
+        log.info(f"Fetching historical candles for {contract.symbol} from {from_str} to {to_str}")
+        try:
+            payload = {
+                "exchange": contract.exchange,
+                "symboltoken": contract.token,
+                "interval": "ONE_MINUTE",
+                "fromdate": from_str,
+                "todate": to_str,
+            }
+            candle_data = self.api.connection.getCandleData(payload)
+            return candle_data.get("data", []) or []
+        except Exception as e:
+            log.error(f"Failed to fetch historical candles for {contract.symbol}: {e}")
+            return []
+
     def prepare_contracts(self):
+        """
+        Selects contracts and pre-fills VWAP with historical data from 9:15 AM.
+        """
+        # 1. Initial strike selection based on 15-min candle
         first15 = get_nifty_first_15m_close(self.trading_date)
         strikes_info = get_single_ce_pe_strikes(first15)
         ce_strike, pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
-        log.info("event=SETUP | First15=%s, CE_Strike=%s, PE_Strike=%s", first15, ce_strike, pe_strike)
+        log.info(f"event=SETUP | Initial strikes: CE={ce_strike}, PE={pe_strike}")
 
         self.ce_contract = find_nifty_option(ce_strike, "CE", self.expiry, self.trading_date)
         self.pe_contract = find_nifty_option(pe_strike, "PE", self.expiry, self.trading_date)
-        log.info("event=SETUP | Resolved CE: %s (token=%s)", self.ce_contract.symbol, self.ce_contract.token)
-        log.info("event=SETUP | Resolved PE: %s (token=%s)", self.pe_contract.symbol, self.pe_contract.token)
+        
+        # 2. Initialize VWAP with historical data
+        now = datetime.now()
+        start_of_day = datetime.combine(self.trading_date, dt_time(9, 15))
+        
+        if now > start_of_day:
+            log.info("event=VWAP_INIT | Pre-filling VWAP from 9:15 AM to current time.")
+            ce_hist_bars = self._get_historical_candles(self.ce_contract, start_of_day, now)
+            pe_hist_bars = self._get_historical_candles(self.pe_contract, start_of_day, now)
+
+            if ce_hist_bars and pe_hist_bars:
+                for ce_bar, pe_bar in zip(ce_hist_bars, pe_hist_bars):
+                    # Candle format: [timestamp, open, high, low, close, volume]
+                    ce_price = float(ce_bar[4])
+                    pe_price = float(pe_bar[4])
+                    ce_vol = float(ce_bar[5] or 0)
+                    pe_vol = float(pe_bar[5] or 0)
+                    
+                    sum_price = ce_price + pe_price
+                    sum_vol = ce_vol + pe_vol if (ce_vol + pe_vol) > 0 else 1.0
+                    
+                    self.cum_pv += sum_price * sum_vol
+                    self.cum_vol += sum_vol
+                
+                if self.cum_vol > 0:
+                    initial_vwap = self.cum_pv / self.cum_vol
+                    log.info(f"event=VWAP_INIT | VWAP initialized to {initial_vwap:.2f} with {len(ce_hist_bars)} historical bars.")
+                else:
+                    log.warning("event=VWAP_INIT | No volume in historical data. VWAP starts at 0.")
+            else:
+                log.warning("event=VWAP_INIT | Could not fetch historical data. VWAP will start from now.")
+
+        log.info("event=SETUP | Final contracts: CE=%s, PE=%s", self.ce_contract.symbol, self.pe_contract.symbol)
+
 
     def _on_tick(self, payload: dict):
         try:
@@ -170,9 +225,9 @@ class StrangleLive:
         log.error(f"Order {order_id} did not complete in time.")
         return None
 
-    def _execute_entry(self):
+    def _execute_entry(self, current_sum_price: float, current_vwap: float):
         """Places entry orders and confirms execution."""
-        log.info("Executing entry logic...")
+        log.info(f"event=ORDER_ENTRY_INIT | Triggered at sum_price={current_sum_price:.2f}, vwap={current_vwap:.2f}")
         
         # --- Place CE SELL Order ---
         try:
@@ -182,8 +237,9 @@ class StrangleLive:
                 quantity=self.NIFTY_LOT_SIZE,
                 transaction_type="SELL",
             )
+            log.info(f"event=ORDER_CE_SELL | Order ID: {ce_order_id}")
         except Exception as e:
-            log.error(f"{Fore.RED}Failed to place CE SELL order: {e}")
+            log.error(f"{Fore.RED}event=ORDER_CE_SELL_FAILED | Failed to place CE SELL order: {e}")
             return
 
         # --- Place PE SELL Order ---
@@ -194,10 +250,11 @@ class StrangleLive:
                 quantity=self.NIFTY_LOT_SIZE,
                 transaction_type="SELL",
             )
+            log.info(f"event=ORDER_PE_SELL | Order ID: {pe_order_id}")
         except Exception as e:
-            log.error(f"{Fore.RED}Failed to place PE SELL order: {e}")
-            log.warning("PE order failed. Attempting to exit the CE leg to avoid naked position.")
-            self._execute_exit(ce_only=True) # Exit the leg that was entered
+            log.error(f"{Fore.RED}event=ORDER_PE_SELL_FAILED | Failed to place PE SELL order: {e}")
+            log.warning("event=ORDER_PE_SELL_FAILED | PE order failed. Attempting to exit the CE leg to avoid naked position.")
+            self._execute_exit(ce_only=True, exit_reason="PE_ORDER_FAILED") # Exit the leg that was entered
             return
 
         # --- Confirm Execution and Get Prices ---
@@ -205,8 +262,8 @@ class StrangleLive:
         pe_order_details = self._poll_order_status(pe_order_id)
 
         if not ce_order_details or not pe_order_details:
-            log.error("One or both entry orders did not complete. Attempting to exit all.")
-            self._execute_exit(ce_only=bool(ce_order_details), pe_only=bool(pe_order_details))
+            log.error("event=ORDER_CONFIRM_FAILED | One or both entry orders did not complete. Attempting to exit all.")
+            self._execute_exit(ce_only=bool(ce_order_details), pe_only=bool(pe_order_details), exit_reason="PARTIAL_ENTRY_FAILED")
             return
 
         actual_ce_entry_price = float(ce_order_details["averageprice"])
@@ -217,51 +274,66 @@ class StrangleLive:
             "ts": datetime.now().isoformat(),
             "ce_entry": actual_ce_entry_price,
             "pe_entry": actual_pe_entry_price,
+            "entry_sum_price": current_sum_price,
+            "entry_vwap": current_vwap,
         }
         self.ce_stop = actual_ce_entry_price * 1.70
         self.pe_stop = actual_pe_entry_price * 1.70
         
         entry_details = (f"LIVE ENTRY CONFIRMED | CE Price: {actual_ce_entry_price:.2f}, PE Price: {actual_pe_entry_price:.2f} "
-                         f"(SLs: CE={self.ce_stop:.2f}, PE={self.pe_stop:.2f})")
-        log.info(f"{Fore.GREEN}{entry_details}")
+                         f"(SLs: CE={self.ce_stop:.2f}, PE={self.pe_stop:.2f}) | "
+                         f"Trigger Sum={current_sum_price:.2f}, Trigger VWAP={current_vwap:.2f}")
+        log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | {entry_details}")
         self.log_event(datetime.now(), "ENTRY_CONFIRMED", entry_details)
 
-    def _execute_exit(self, ce_only=False, pe_only=False):
+    def _execute_exit(self, ce_only=False, pe_only=False, exit_reason="STRATEGY_EXIT"):
         """Places BUY orders to exit the position."""
-        log.info("Executing exit logic...")
+        log.info(f"event=ORDER_EXIT_INIT | Triggered by: {exit_reason}")
+        
+        ce_exit_price = self.latest_ltp.get(str(self.ce_contract.token), 0.0)
+        pe_exit_price = self.latest_ltp.get(str(self.pe_contract.token), 0.0)
+
         if not ce_only:
             try:
-                self.api.place_order(
+                pe_order_id = self.api.place_order(
                     tradingsymbol=self.pe_contract.symbol,
                     symbol_token=self.pe_contract.token,
                     quantity=self.NIFTY_LOT_SIZE,
                     transaction_type="BUY",
                 )
-                log.info(f"{Fore.GREEN}Placed PE BUY order to exit.")
+                log.info(f"{Fore.GREEN}event=ORDER_PE_BUY | Order ID: {pe_order_id}")
             except Exception as e:
-                log.error(f"{Fore.RED}Failed to place PE BUY order: {e}")
+                log.error(f"{Fore.RED}event=ORDER_PE_BUY_FAILED | Failed to place PE BUY order: {e}")
 
         if not pe_only:
             try:
-                self.api.place_order(
+                ce_order_id = self.api.place_order(
                     tradingsymbol=self.ce_contract.symbol,
                     symbol_token=self.ce_contract.token,
                     quantity=self.NIFTY_LOT_SIZE,
                     transaction_type="BUY",
                 )
-                log.info(f"{Fore.GREEN}Placed CE BUY order to exit.")
+                log.info(f"{Fore.GREEN}event=ORDER_CE_BUY | Order ID: {ce_order_id}")
             except Exception as e:
-                log.error(f"{Fore.RED}Failed to place CE BUY order: {e}")
+                log.error(f"{Fore.RED}event=ORDER_CE_BUY_FAILED | Failed to place CE BUY order: {e}")
         
         self.in_position = False
+        self.exit_info = {
+            "ts": datetime.now().isoformat(),
+            "ce_exit": ce_exit_price,
+            "pe_exit": pe_exit_price,
+            "reason": exit_reason,
+        }
+        log.info(f"event=EXIT_CONFIRMED | CE Exit={ce_exit_price:.2f}, PE Exit={pe_exit_price:.2f}, Reason={exit_reason}")
+        self.log_event(datetime.now(), "EXIT_CONFIRMED", json.dumps(self.exit_info))
         self._close_ws()
 
     def _process_strategy_on_tick(self, updated_token: str, updated_ltp: float, updated_vol: float):
         now = datetime.now()
         
-        if self.in_position and now.time() >= dt_time(15, 5):
+        if self.in_position and now.time() >= dt_time(14, 50):
             log.info("EOD trigger. Exiting position.")
-            self._execute_exit()
+            self._execute_exit(exit_reason="EOD")
             return
 
         ce_token = str(self.ce_contract.token)
@@ -281,11 +353,11 @@ class StrangleLive:
             if not self.seen_sum_above_vwap:
                 if sum_price > vwap:
                     self.seen_sum_above_vwap = True
-                    log.info(f"{Fore.CYAN}event=CONDITION_MET | price > vwap. Armed for entry.")
+                    log.info(f"{Fore.CYAN}event=CONDITION_MET | price={sum_price:.2f} > vwap={vwap:.2f}. Armed for entry.")
             else:
                 if sum_price <= vwap:
-                    log.info(f"{Fore.YELLOW}event=ENTRY_TRIGGERED | price <= vwap. Executing entry.")
-                    self._execute_entry()
+                    log.info(f"{Fore.YELLOW}event=ENTRY_TRIGGERED | price={sum_price:.2f} <= vwap={vwap:.2f}. Executing entry.")
+                    self._execute_entry(sum_price, vwap) # Pass current sum_price and vwap
         else: # In position, check for P&L and SL
             entry_ce = self.entry_info.get("ce_entry", 0)
             entry_pe = self.entry_info.get("pe_entry", 0)
@@ -303,7 +375,7 @@ class StrangleLive:
             if ce_ltp >= ce_stop_price or pe_ltp >= pe_stop_price:
                 reason = "CE_SL_HIT" if ce_ltp >= ce_stop_price else "PE_SL_HIT"
                 log.info(f"{Fore.RED}event=EXIT_SL | {reason}. Exiting position.")
-                self._execute_exit()
+                self._execute_exit(exit_reason=reason)
 
     def run(self):
         self.prepare_contracts()

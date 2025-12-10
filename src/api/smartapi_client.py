@@ -10,6 +10,7 @@ import yaml
 import pyotp
 import logging
 import uuid
+import json
 
 try:
     from SmartApi import SmartConnect
@@ -105,15 +106,15 @@ class AngelAPI:
             "quantity": quantity,
         }
         
-        response = self.connection.placeOrder(order_params)
+        order_id = self.connection.placeOrder(order_params)
         
-        if response and response.get("status") and response.get("data", {}).get("orderid"):
-            order_id = response["data"]["orderid"]
+        if order_id:
             log.info(f"Successfully placed order for {tradingsymbol}. Order ID: {order_id}")
             return order_id
         else:
-            error_msg = response.get("message", "Unknown error")
-            raise RuntimeError(f"Order placement failed for {tradingsymbol}: {error_msg}")
+            # If order_id is None, it means the order placement failed.
+            # The underlying library might log more details, but we raise a generic error here.
+            raise RuntimeError(f"Order placement failed for {tradingsymbol}. No order ID returned.")
 
     def get_order_book(self) -> list[dict] | None:
         """
@@ -142,7 +143,7 @@ class AngelAPI:
         if self.mock:
             # Simulate a completed order for testing purposes
             log.info(f"MOCK get_order_status for {order_id}")
-            return {"status": "complete", "averageprice": 100.0, "filledshares": 50, "orderid": order_id}
+            return {"status": "complete", "averageprice": 100.0, "filledshares": 75, "orderid": order_id}
 
         order_book = self.get_order_book()
         if order_book:

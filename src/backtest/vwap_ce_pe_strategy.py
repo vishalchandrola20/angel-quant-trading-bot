@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, date, time
+import time as time_module
 
 from src.api.smartapi_client import AngelAPI
 from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
@@ -16,6 +17,7 @@ import csv
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+LOT_SIZE = 75
 
 @dataclass
 class Bar:
@@ -44,7 +46,7 @@ def _fetch_intraday_bars_for_ce_pe(
     """
     1. Get first 15m close & CE/PE strikes (your custom logic)
     2. Resolve CE & PE option contracts (auto-expiry if not provided)
-    3. Fetch intraday candles for CE & PE from 09:30 to 15:00
+    3. Fetch intraday candles for CE & PE from 09:30 to 15:15
     """
 
     # 1) First 15m close & strikes
@@ -64,11 +66,12 @@ def _fetch_intraday_bars_for_ce_pe(
     # 3) Fetch intraday candles from SmartAPI
     api = AngelAPI()
     api.login()
+    time_module.sleep(1)
     if api.mock:
         raise RuntimeError("AngelAPI in MOCK mode; cannot backtest with real data.")
 
     start_dt = datetime.combine(trading_date, time(9, 30))
-    end_dt = datetime.combine(trading_date, time(15, 0))
+    end_dt = datetime.combine(trading_date, time(15, 15)) # Changed to 15:15
 
     from_str = start_dt.strftime("%Y-%m-%d %H:%M")
     to_str = end_dt.strftime("%Y-%m-%d %H:%M")
@@ -122,9 +125,10 @@ def _fetch_intraday_bars_for_ce_pe(
 
 def run_vwap_strangle_strategy_for_day(
         trading_date: date,
-        bar_interval: str = "ONE_MINUTE",  # switched to 1-min
+        bar_interval: str = "ONE_MINUTE",
         expiry_str: str | None = None,
-        stop_loss_pct: float = 0.70,       # 70% SL
+        stop_loss_pct: float = 0.70,
+        absolute_stop_loss: float = 2000.0,
         export_csv: bool = True,
 ):
     """
@@ -134,8 +138,10 @@ def run_vwap_strangle_strategy_for_day(
       - Entry condition:
           * Wait until sum > VWAP at least once
           * Then, when sum comes back down to VWAP or below => SELL both CE & PE
-      - SL: 70% per leg (if either leg goes +70% over entry, exit both)
-      - Otherwise exit at last bar (~3 pm) and book P&L
+      - Exit condition (whichever comes first):
+          * Per-leg SL: 70% (if either leg goes +70% over entry)
+          * Absolute SL: Total loss reaches 2000
+          * EOD: Exit at last bar (~3 pm)
       - Also: export per-bar data (VWAP vs sum) to CSV for visualization
     """
 
@@ -143,8 +149,8 @@ def run_vwap_strangle_strategy_for_day(
         trading_date, bar_interval, expiry_str
     )
 
-    cum_pv = 0.0   # cumulative (price * volume)
-    cum_vol = 0.0  # cumulative volume
+    cum_pv = 0.0
+    cum_vol = 0.0
 
     seen_sum_above_vwap = False
     in_position = False
@@ -157,7 +163,6 @@ def run_vwap_strangle_strategy_for_day(
 
     ce_stop = pe_stop = None
 
-    # for CSV export
     records: list[dict] = []
 
     for i, bar in enumerate(bars):
@@ -172,15 +177,13 @@ def run_vwap_strangle_strategy_for_day(
         exit_flag = False
         current_reason = ""
 
-        # 1) Before entry: wait for sum > VWAP at least once, then sum <= VWAP
-        if not in_position:
+        # Only check for entry if we haven't already exited a trade today
+        if not in_position and exit_index is None:
             if not seen_sum_above_vwap:
                 if price > vwap:
                     seen_sum_above_vwap = True
             else:
-                # we've seen sum > VWAP earlier; now look for price <= VWAP
                 if price <= vwap:
-                    # ENTRY: short both CE & PE at this bar
                     in_position = True
                     entry_index = i
                     entry_ce = bar.ce_close
@@ -197,27 +200,36 @@ def run_vwap_strangle_strategy_for_day(
                         f"{ce_symbol}={entry_ce:.2f}, {pe_symbol}={entry_pe:.2f}, "
                         f"Sum={price:.2f}, VWAP={vwap:.2f}"
                     )
-        else:
-            # 2) After entry: check SL
+        
+        # If we are in a position, check for exits
+        if in_position:
             ce_p = bar.ce_close
             pe_p = bar.pe_close
+            
+            pnl_ce = (entry_ce - ce_p) * LOT_SIZE
+            pnl_pe = (entry_pe - pe_p) * LOT_SIZE
+            total_pnl = pnl_ce + pnl_pe
 
+            temp_exit_reason = None
             if ce_p >= ce_stop or pe_p >= pe_stop:
-                in_position = False
+                temp_exit_reason = "STOP_LOSS_PCT"
+            elif total_pnl <= -absolute_stop_loss:
+                temp_exit_reason = "STOP_LOSS_ABS"
+
+            if temp_exit_reason:
+                in_position = False # We are now out of the position
                 exit_index = i
                 exit_ce = ce_p
                 exit_pe = pe_p
-                exit_reason = "STOP_LOSS"
-
+                exit_reason = temp_exit_reason
                 exit_flag = True
                 current_reason = exit_reason
 
                 print(
-                    f"EXIT (SL) at {bar.ts}: "
-                    f"{ce_symbol}={exit_ce:.2f}, {pe_symbol}={exit_pe:.2f}"
+                    f"EXIT ({exit_reason}) at {bar.ts}: "
+                    f"{ce_symbol}={exit_ce:.2f}, {pe_symbol}={exit_pe:.2f}, Total PNL={total_pnl:.2f}"
                 )
 
-        # Store bar record (state at this bar)
         records.append(
             {
                 "ts": bar.ts,
@@ -234,20 +246,14 @@ def run_vwap_strangle_strategy_for_day(
             }
         )
 
-        # If SL exit happened, break after recording this bar
-        if exit_flag and exit_reason == "STOP_LOSS":
-            break
-
-    # 3) If still in position at end of day, exit at last bar (EOD)
-    if in_position:
+    # If a trade was entered but not exited by SL, it's an EOD exit
+    if entry_index is not None and exit_index is None:
         last_bar = bars[-1]
-        in_position = False
         exit_index = len(bars) - 1
         exit_ce = last_bar.ce_close
         exit_pe = last_bar.pe_close
         exit_reason = "EOD"
 
-        # mark exit on last record
         records[-1]["exit_flag"] = 1
         records[-1]["reason"] = exit_reason
 
@@ -256,15 +262,14 @@ def run_vwap_strangle_strategy_for_day(
             f"{ce_symbol}={exit_ce:.2f}, {pe_symbol}={exit_pe:.2f}"
         )
 
-    # 4) If we never entered, export CSV anyway (just no entry/exit)
     if entry_index is None:
         print("No entry signal for the day (VWAP pattern never met).")
 
-    # 5) Compute P&L if we had a trade
     if entry_index is not None and exit_index is not None:
-        pnl_ce = entry_ce - exit_ce
-        pnl_pe = entry_pe - exit_pe
-        total_pnl = pnl_ce + pnl_pe
+        pnl_ce_per_share = entry_ce - exit_ce
+        pnl_pe_per_share = entry_pe - exit_pe
+        
+        total_pnl_per_lot = (pnl_ce_per_share + pnl_pe_per_share) * LOT_SIZE
 
         print("\n--- Day Summary ---")
         print(f"Date: {trading_date}")
@@ -273,28 +278,19 @@ def run_vwap_strangle_strategy_for_day(
         print(f"Entry bar index: {entry_index} at price CE={entry_ce:.2f}, PE={entry_pe:.2f}")
         print(f"Exit bar index: {exit_index} at price CE={exit_ce:.2f}, PE={exit_pe:.2f}")
         print(f"Exit reason: {exit_reason}")
-        print(f"PNL CE: {pnl_ce:.2f}")
-        print(f"PNL PE: {pnl_pe:.2f}")
-        print(f"Total PNL (per lot): {total_pnl:.2f}")
+        print(f"PNL CE (per share): {pnl_ce_per_share:.2f}")
+        print(f"PNL PE (per share): {pnl_pe_per_share:.2f}")
+        print(f"Total PNL (1 lot of {LOT_SIZE}): {total_pnl_per_lot:.2f}")
 
-    # 6) Export CSV for plotting
     if export_csv:
         out_dir = Path("data/processed/strangle")
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"vwap_backtest_{trading_date}.csv"
 
         fieldnames = [
-            "ts",
-            "ce_close",
-            "pe_close",
-            "sum_price",
-            "vwap",
-            "ce_volume",
-            "pe_volume",
-            "in_position",
-            "entry_flag",
-            "exit_flag",
-            "reason",
+            "ts", "ce_close", "pe_close", "sum_price", "vwap",
+            "ce_volume", "pe_volume", "in_position", "entry_flag",
+            "exit_flag", "reason",
         ]
 
         with out_path.open("w", newline="") as f:

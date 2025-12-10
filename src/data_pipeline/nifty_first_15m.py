@@ -1,6 +1,9 @@
 # src/data_pipeline/nifty_first_15m.py
+import time
 from datetime import datetime, date, time
 import logging
+from threading import Thread
+import time as time_module
 
 from src.api.smartapi_client import AngelAPI
 
@@ -31,6 +34,7 @@ def get_nifty_first_15m_close(trading_date: date | None = None) -> float:
 
     api = AngelAPI()
     api.login()
+    time_module.sleep(1)
     if api.mock:
         raise RuntimeError("AngelAPI is in MOCK mode; cannot fetch real NIFTY candles.")
 
