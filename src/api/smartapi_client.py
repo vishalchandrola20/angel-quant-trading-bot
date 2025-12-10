@@ -10,7 +10,6 @@ import yaml
 import pyotp
 import logging
 import uuid
-import json
 
 try:
     from SmartApi import SmartConnect
@@ -159,6 +158,7 @@ class AngelAPI:
         
         try:
             response = self.connection.position()
+            log.info(f"Open positions response: {response}")
             if response and response.get("status"):
                 return response.get("data")
             else:

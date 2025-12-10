@@ -186,10 +186,14 @@ class StrangleLive:
 
         ce_pos, pe_pos = None, None
         for pos in open_positions:
-            if pos.get("tradingsymbol") == self.ce_contract.symbol:
-                ce_pos = pos
-            elif pos.get("tradingsymbol") == self.pe_contract.symbol:
-                pe_pos = pos
+            log.info(f"Checking position: {pos.get('tradingsymbol')}, sellqty: {pos.get('sellqty')}, buyqty: {pos.get('buyqty')}")
+            is_net_short = int(pos.get('sellqty', 0)) > int(pos.get('buyqty', 0))
+            
+            if is_net_short:
+                if pos.get("tradingsymbol") == self.ce_contract.symbol:
+                    ce_pos = pos
+                elif pos.get("tradingsymbol") == self.pe_contract.symbol:
+                    pe_pos = pos
         
         if ce_pos and pe_pos:
             log.warning("event=RESUME_POSITION | Found existing open strangle position. Resuming management.")
