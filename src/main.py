@@ -125,9 +125,11 @@ def main():
         )
     
     elif args.task == "calculate_vwap_until":
-        if not args.date or not args.time:
-            raise SystemExit("--date and --time are required for calculate_vwap_until")
-        
+        if not args.date:
+            raise SystemExit("--date is required for calculate_vwap_until")
+        if not args.time:
+            raise SystemExit("--time is required for calculate_vwap_until (format HH:MM)")
+
         trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
         target_time = datetime.strptime(args.time, "%H:%M").time()
         target_dt = datetime.combine(trading_date, target_time)
@@ -144,13 +146,13 @@ def main():
 
         api = AngelAPI()
         api.login()
-        time_module.sleep(1)
+        time_module.sleep(1) # Wait after login
         if api.mock:
-            raise RuntimeError("AngelAPI in MOCK mode; cannot fetch real data.")
+            raise RuntimeError("AngelAPI in MOCK mode; cannot fetch real data for VWAP calculation.")
 
         start_of_day = datetime.combine(trading_date, time(9, 15))
 
-        # Fetch historical candles
+        # Fetch historical candles up to target_dt
         ce_hist_res = api.connection.getCandleData({
             "exchange": ce_contract.exchange,
             "symboltoken": ce_contract.token,
@@ -168,49 +170,51 @@ def main():
 
         ce_hist_bars = ce_hist_res.get("data") or []
         pe_hist_bars = pe_hist_res.get("data") or []
+
         if not ce_hist_bars or not pe_hist_bars:
             print(f"No historical data found for {trading_date} up to {args.time}.")
             return
 
-        ce_cum_pv, ce_cum_vol = 0.0, 0.0
-        pe_cum_pv, pe_cum_vol = 0.0, 0.0
+        cum_pv = 0.0
+        cum_vol = 0.0
 
-        print(f"\n--- VWAP Calculation (Close Price) for {trading_date} up to {args.time} ---")
+        print(f"\n--- VWAP Calculation (OHLC/4) for {trading_date} up to {args.time} ---")
         header = (
             f"{'Time':<8} | {'CE_O':>7} {'CE_H':>7} {'CE_L':>7} {'CE_C':>7} {'CE_V':>10} | "
             f"{'PE_O':>7} {'PE_H':>7} {'PE_L':>7} {'PE_C':>7} {'PE_V':>10} | "
-            f"{'CE_VWAP':>10} {'PE_VWAP':>10}"
+            f"{'OHLC4':>10} {'VWAP':>10}"
         )
         print(header)
         print("-" * len(header))
 
         for ce_bar, pe_bar in zip(ce_hist_bars, pe_hist_bars):
             bar_time = datetime.strptime(ce_bar[0], "%Y-%m-%dT%H:%M:%S%z").strftime("%H:%M")
-            
+
             ce_open, ce_high, ce_low, ce_close, ce_vol = float(ce_bar[1]), float(ce_bar[2]), float(ce_bar[3]), float(ce_bar[4]), float(ce_bar[5] or 0)
             pe_open, pe_high, pe_low, pe_close, pe_vol = float(pe_bar[1]), float(pe_bar[2]), float(pe_bar[3]), float(pe_bar[4]), float(pe_bar[5] or 0)
 
-            # CE VWAP Calculation using Close Price
-            ce_pv = ce_close * ce_vol
-            ce_cum_pv += ce_pv
-            ce_cum_vol += ce_vol
-            ce_vwap = ce_cum_pv / ce_cum_vol if ce_cum_vol > 0 else ce_close
+            combined_open = ce_open + pe_open
+            combined_high = ce_high + pe_high
+            combined_low = ce_low + pe_low
+            combined_close = ce_close + pe_close
+            combined_vol = ce_vol + pe_vol
 
-            # PE VWAP Calculation using Close Price
-            pe_pv = pe_close * pe_vol
-            pe_cum_pv += pe_pv
-            pe_cum_vol += pe_vol
-            pe_vwap = pe_cum_pv / pe_cum_vol if pe_cum_vol > 0 else pe_close
+            ohlc4_price = (combined_open + combined_high + combined_low + combined_close) / 4
+            price_volume = ohlc4_price * combined_vol
+
+            cum_pv += price_volume
+            cum_vol += combined_vol
+
+            vwap = cum_pv / cum_vol if cum_vol > 0 else ohlc4_price
 
             print(
                 f"{bar_time:<8} | {ce_open:>7.2f} {ce_high:>7.2f} {ce_low:>7.2f} {ce_close:>7.2f} {ce_vol:>10.0f} | "
                 f"{pe_open:>7.2f} {pe_high:>7.2f} {pe_low:>7.2f} {pe_close:>7.2f} {pe_vol:>10.0f} | "
-                f"{ce_vwap:>10.2f} {pe_vwap:>10.2f}"
+                f"{ohlc4_price:>10.2f} {vwap:>10.2f}"
             )
 
         print("-" * len(header))
-        print(f"Final CE VWAP at {args.time}: {ce_vwap:.2f}")
-        print(f"Final PE VWAP at {args.time}: {pe_vwap:.2f}")
+        print(f"Final VWAP at {args.time}: {vwap:.2f}")
 
 
 if __name__ == "__main__":
