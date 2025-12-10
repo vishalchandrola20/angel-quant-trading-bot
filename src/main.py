@@ -1,7 +1,7 @@
 # src/main.py
 import argparse
 import time as time_module # Import time_module for sleep
-from datetime import datetime, date, time # Import time from datetime
+from datetime import datetime, time # Import time from datetime
 
 from src.data_pipeline.option_chain import fetch_and_save
 from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
@@ -12,7 +12,6 @@ from src.market.contracts import find_nifty_option # Import find_nifty_option
 
 from src.backtest.vwap_ce_pe_strategy import run_vwap_strangle_strategy_for_day
 from src.backtest.vwap_straddle_strategy import run_vwap_straddle_strategy_for_day
-from src.backtest.vwap_strangle_5_percent_strategy import run_vwap_strangle_5_percent_strategy_for_day
 
 
 
@@ -107,22 +106,6 @@ def main():
             stop_loss_pct=0.70,
             export_csv=True,
     )
-
-    elif args.task == "backtest_vwap_strangle_5_percent":
-        if not args.date:
-            raise SystemExit("--date is required for backtest_vwap_strangle_5_percent")
-        trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
-        expiry_str = args.expiry or None
-
-        run_vwap_strangle_5_percent_strategy_for_day(
-            trading_date=trading_date,
-            bar_interval="ONE_MINUTE",
-            expiry_str=expiry_str,
-            stop_loss_pct=0.70,
-            absolute_stop_loss=2000.0,
-            vwap_band_pct=0.15, # Changed to 15%
-            export_csv=True,
-        )
     
     elif args.task == "calculate_vwap_until":
         if not args.date:
@@ -210,7 +193,7 @@ def main():
             print(
                 f"{bar_time:<8} | {ce_open:>7.2f} {ce_high:>7.2f} {ce_low:>7.2f} {ce_close:>7.2f} {ce_vol:>10.0f} | "
                 f"{pe_open:>7.2f} {pe_high:>7.2f} {pe_low:>7.2f} {pe_close:>7.2f} {pe_vol:>10.0f} | "
-                f"{ohlc4_price:>10.2f} {vwap:>10.2f}"
+                f"{ohlc4_price:>10.2f} {vwap:>10.2f} {combined_close:>10.2f}"
             )
 
         print("-" * len(header))

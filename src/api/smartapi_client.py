@@ -112,8 +112,6 @@ class AngelAPI:
             log.info(f"Successfully placed order for {tradingsymbol}. Order ID: {order_id}")
             return order_id
         else:
-            # If order_id is None, it means the order placement failed.
-            # The underlying library might log more details, but we raise a generic error here.
             raise RuntimeError(f"Order placement failed for {tradingsymbol}. No order ID returned.")
 
     def get_order_book(self) -> list[dict] | None:
@@ -141,7 +139,6 @@ class AngelAPI:
         Returns the order details dictionary if found, otherwise None.
         """
         if self.mock:
-            # Simulate a completed order for testing purposes
             log.info(f"MOCK get_order_status for {order_id}")
             return {"status": "complete", "averageprice": 100.0, "filledshares": 75, "orderid": order_id}
 
@@ -151,6 +148,25 @@ class AngelAPI:
                 if order.get("orderid") == order_id:
                     return order
         return None
+
+    def get_open_positions(self) -> list[dict] | None:
+        """
+        Fetches all open positions.
+        """
+        if self.mock:
+            log.info("MOCK get_open_positions returning empty list.")
+            return []
+        
+        try:
+            response = self.connection.position()
+            if response and response.get("status"):
+                return response.get("data")
+            else:
+                log.error(f"Failed to fetch open positions: {response.get('message', 'Unknown error')}")
+                return None
+        except Exception as e:
+            log.exception("Exception while fetching open positions.")
+            return None
 
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str | int) -> float:
         """
@@ -165,8 +181,6 @@ class AngelAPI:
             tradingsymbol=tradingsymbol,
             symboltoken=str(symboltoken),
         )
-        # Expected format (simplified):
-        # {"status": True, "data": {"ltp": 123.45, ...}, ...}
         data = resp.get("data") or {}
         ltp = data.get("ltp")
         if ltp is None:
@@ -178,12 +192,8 @@ if __name__ == "__main__":
     api.login()
     if not api.mock:
         try:
-            # This is an example and will need a valid symbol and token
-            # For testing, you might need to fetch a valid contract first
-            # order_id = api.place_order("NIFTY...", "...", 50, "BUY")
-            # time.sleep(1)
-            # status = api.get_order_status(order_id)
-            # print("Order Status:", status)
+            positions = api.get_open_positions()
+            print("Open Positions:", positions)
             
             order_book = api.get_order_book()
             print("Order Book:", order_book)

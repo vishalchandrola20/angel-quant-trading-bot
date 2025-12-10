@@ -131,9 +131,8 @@ class StrangleLive:
 
     def prepare_contracts(self):
         """
-        Selects contracts and pre-fills VWAP with historical data from 9:15 AM.
+        Selects contracts and pre-fills VWAP with historical data from 9:15 AM using OHLC/4.
         """
-        # 1. Initial strike selection based on 15-min candle
         first15 = get_nifty_first_15m_close(self.trading_date)
         strikes_info = get_single_ce_pe_strikes(first15)
         ce_strike, pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
@@ -142,28 +141,30 @@ class StrangleLive:
         self.ce_contract = find_nifty_option(ce_strike, "CE", self.expiry, self.trading_date)
         self.pe_contract = find_nifty_option(pe_strike, "PE", self.expiry, self.trading_date)
         
-        # 2. Initialize VWAP with historical data
         now = datetime.now()
         start_of_day = datetime.combine(self.trading_date, dt_time(9, 15))
         
         if now > start_of_day:
-            log.info("event=VWAP_INIT | Pre-filling VWAP from 9:15 AM to current time.")
+            log.info("event=VWAP_INIT | Pre-filling VWAP from 9:15 AM to current time using OHLC/4.")
             ce_hist_bars = self._get_historical_candles(self.ce_contract, start_of_day, now)
             pe_hist_bars = self._get_historical_candles(self.pe_contract, start_of_day, now)
 
             if ce_hist_bars and pe_hist_bars:
                 for ce_bar, pe_bar in zip(ce_hist_bars, pe_hist_bars):
-                    # Candle format: [timestamp, open, high, low, close, volume]
-                    ce_price = float(ce_bar[4])
-                    pe_price = float(pe_bar[4])
-                    ce_vol = float(ce_bar[5] or 0)
-                    pe_vol = float(pe_bar[5] or 0)
+                    ce_open, ce_high, ce_low, ce_close, ce_vol = float(ce_bar[1]), float(ce_bar[2]), float(ce_bar[3]), float(ce_bar[4]), float(ce_bar[5] or 0)
+                    pe_open, pe_high, pe_low, pe_close, pe_vol = float(pe_bar[1]), float(pe_bar[2]), float(pe_bar[3]), float(pe_bar[4]), float(pe_bar[5] or 0)
                     
-                    sum_price = ce_price + pe_price
-                    sum_vol = ce_vol + pe_vol if (ce_vol + pe_vol) > 0 else 1.0
+                    combined_open = ce_open + pe_open
+                    combined_high = ce_high + pe_high
+                    combined_low = ce_low + pe_low
+                    combined_close = ce_close + pe_close
+                    combined_vol = ce_vol + pe_vol
                     
-                    self.cum_pv += sum_price * sum_vol
-                    self.cum_vol += sum_vol
+                    ohlc4_price = (combined_open + combined_high + combined_low + combined_close) / 4
+                    price_volume = ohlc4_price * combined_vol
+                    
+                    self.cum_pv += price_volume
+                    self.cum_vol += combined_vol
                 
                 if self.cum_vol > 0:
                     initial_vwap = self.cum_pv / self.cum_vol
@@ -175,6 +176,40 @@ class StrangleLive:
 
         log.info("event=SETUP | Final contracts: CE=%s, PE=%s", self.ce_contract.symbol, self.pe_contract.symbol)
 
+    def _check_and_resume_position(self):
+        """Checks for open positions at startup and resumes managing them."""
+        log.info("Checking for existing open positions...")
+        open_positions = self.api.get_open_positions()
+        if not open_positions:
+            log.info("No open positions found.")
+            return
+
+        ce_pos, pe_pos = None, None
+        for pos in open_positions:
+            if pos.get("tradingsymbol") == self.ce_contract.symbol:
+                ce_pos = pos
+            elif pos.get("tradingsymbol") == self.pe_contract.symbol:
+                pe_pos = pos
+        
+        if ce_pos and pe_pos:
+            log.warning("event=RESUME_POSITION | Found existing open strangle position. Resuming management.")
+            self.in_position = True
+            
+            actual_ce_entry_price = float(ce_pos['sellavgprice'])
+            actual_pe_entry_price = float(pe_pos['sellavgprice'])
+
+            self.entry_info = {
+                "ts": datetime.now().isoformat(),
+                "ce_entry": actual_ce_entry_price,
+                "pe_entry": actual_pe_entry_price,
+            }
+            self.ce_stop = actual_ce_entry_price * 1.70
+            self.pe_stop = actual_pe_entry_price * 1.70
+            
+            log.info(f"Resumed with entry prices: CE={actual_ce_entry_price:.2f}, PE={actual_pe_entry_price:.2f}")
+            log.info(f"Resumed with SL levels: CE={self.ce_stop:.2f}, PE={self.pe_stop:.2f}")
+        else:
+            log.info("No matching strangle position found to resume.")
 
     def _on_tick(self, payload: dict):
         try:
@@ -343,10 +378,18 @@ class StrangleLive:
 
         if ce_ltp is None or pe_ltp is None: return
 
+        # For live ticks, we use LTP as a proxy for the bar's price
+        # The historical pre-fill uses OHLC4, but live ticks are just LTP.
+        # We use sum_price (CE LTP + PE LTP) for the current tick's price component.
         sum_price = ce_ltp + pe_ltp
-        sum_vol = updated_vol if updated_vol > 0 else 1.0
-        self.cum_pv += sum_price * sum_vol
-        self.cum_vol += sum_vol
+        
+        # The volume for a live tick is the trade volume, not the cumulative bar volume
+        # We use updated_vol which comes from the tick itself
+        price_volume = sum_price * updated_vol
+        
+        self.cum_pv += price_volume
+        self.cum_vol += updated_vol
+        
         vwap = self.cum_pv / self.cum_vol if self.cum_vol > 0 else sum_price
 
         if not self.in_position:
@@ -357,7 +400,7 @@ class StrangleLive:
             else:
                 if sum_price <= vwap:
                     log.info(f"{Fore.YELLOW}event=ENTRY_TRIGGERED | price={sum_price:.2f} <= vwap={vwap:.2f}. Executing entry.")
-                    self._execute_entry(sum_price, vwap) # Pass current sum_price and vwap
+                    self._execute_entry(sum_price, vwap)
         else: # In position, check for P&L and SL
             entry_ce = self.entry_info.get("ce_entry", 0)
             entry_pe = self.entry_info.get("pe_entry", 0)
@@ -379,6 +422,7 @@ class StrangleLive:
 
     def run(self):
         self.prepare_contracts()
+        self._check_and_resume_position()
 
         if SmartWebSocketV2 is None:
             log.error("SmartWebSocketV2 not available. Cannot run.")

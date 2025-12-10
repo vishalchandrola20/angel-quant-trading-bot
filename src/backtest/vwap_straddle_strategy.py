@@ -18,17 +18,35 @@ logging.basicConfig(level=logging.INFO)
 @dataclass
 class Bar:
     ts: str
+    ce_open: float
+    ce_high: float
+    ce_low: float
     ce_close: float
-    pe_close: float
     ce_volume: float
+    pe_open: float
+    pe_high: float
+    pe_low: float
+    pe_close: float
     pe_volume: float
 
     @property
-    def sum_price(self) -> float:
+    def combined_open(self) -> float:
+        return self.ce_open + self.pe_open
+    
+    @property
+    def combined_high(self) -> float:
+        return self.ce_high + self.pe_high
+
+    @property
+    def combined_low(self) -> float:
+        return self.ce_low + self.pe_low
+
+    @property
+    def combined_close(self) -> float:
         return self.ce_close + self.pe_close
 
     @property
-    def sum_volume(self) -> float:
+    def combined_volume(self) -> float:
         v = (self.ce_volume or 0) + (self.pe_volume or 0)
         return v if v > 0 else 1.0
 
@@ -98,10 +116,8 @@ def _fetch_intraday_bars_for_atm_straddle(
         bars.append(
             Bar(
                 ts=str(ts_ce),
-                ce_close=float(c1),
-                pe_close=float(c2),
-                ce_volume=float(v1 or 0),
-                pe_volume=float(v2 or 0),
+                ce_open=float(o1), ce_high=float(h1), ce_low=float(l1), ce_close=float(c1), ce_volume=float(v1 or 0),
+                pe_open=float(o2), pe_high=float(h2), pe_low=float(l2), pe_close=float(c2), pe_volume=float(v2 or 0),
             )
         )
 
@@ -138,12 +154,12 @@ def run_vwap_straddle_strategy_for_day(
     records: list[dict] = []
 
     for i, bar in enumerate(bars):
-        price = bar.sum_price
-        volume = bar.sum_volume
-
-        cum_pv += price * volume
+        ohlc4_price = (bar.combined_open + bar.combined_high + bar.combined_low + bar.combined_close) / 4
+        volume = bar.combined_volume
+        
+        cum_pv += ohlc4_price * volume
         cum_vol += volume
-        vwap = cum_pv / cum_vol if cum_vol > 0 else price
+        vwap = cum_pv / cum_vol if cum_vol > 0 else ohlc4_price
 
         entry_flag = False
         exit_flag = False
@@ -152,10 +168,11 @@ def run_vwap_straddle_strategy_for_day(
         # Entry rule: wait for sum > VWAP, then when sum <= VWAP -> SELL both legs
         if not in_position:
             if not seen_sum_above_vwap:
-                if price > vwap:
+                if bar.combined_close > vwap:
                     seen_sum_above_vwap = True
+                    log.info(f"ARMED at {bar.ts}: Combined Close={bar.combined_close:.2f} > VWAP={vwap:.2f}")
             else:
-                if price <= vwap:
+                if bar.combined_close <= vwap:
                     in_position = True
                     entry_index = i
                     entry_ce = bar.ce_close
@@ -168,7 +185,8 @@ def run_vwap_straddle_strategy_for_day(
                     current_reason = "ENTRY"
 
                     print(
-                        f"ENTRY at {bar.ts}: {ce_symbol}={entry_ce:.2f}, {pe_symbol}={entry_pe:.2f}, Sum={price:.2f}, VWAP={vwap:.2f}"
+                        f"ENTRY at {bar.ts}: Combined Close={bar.combined_close:.2f}, VWAP={vwap:.2f} | "
+                        f"CE_Entry={entry_ce:.2f}, PE_Entry={entry_pe:.2f}"
                     )
         else:
             # After entry: check per-leg SL
@@ -184,7 +202,10 @@ def run_vwap_straddle_strategy_for_day(
                 exit_flag = True
                 current_reason = exit_reason
 
-                print(f"EXIT (SL) at {bar.ts}: {ce_symbol}={exit_ce:.2f}, {pe_symbol}={exit_pe:.2f}")
+                print(
+                    f"EXIT (SL) at {bar.ts}: Combined Close={bar.combined_close:.2f} | "
+                    f"CE_Exit={exit_ce:.2f}, PE_Exit={exit_pe:.2f}"
+                )
                 # record and break after this bar
 
         records.append(
@@ -192,10 +213,10 @@ def run_vwap_straddle_strategy_for_day(
                 "ts": bar.ts,
                 "ce_close": bar.ce_close,
                 "pe_close": bar.pe_close,
-                "sum_price": price,
+                "sum_price": bar.combined_close,
+                "vwap": vwap,
                 "ce_volume": bar.ce_volume,
                 "pe_volume": bar.pe_volume,
-                "vwap": vwap,
                 "in_position": int(in_position),
                 "entry_flag": int(entry_flag),
                 "exit_flag": int(exit_flag),
@@ -218,7 +239,10 @@ def run_vwap_straddle_strategy_for_day(
         records[-1]["exit_flag"] = 1
         records[-1]["reason"] = exit_reason
 
-        print(f"EXIT (EOD) at {last_bar.ts}: {ce_symbol}={exit_ce:.2f}, {pe_symbol}={exit_pe:.2f}")
+        print(
+            f"EXIT (EOD) at {last_bar.ts}: Combined Close={last_bar.combined_close:.2f} | "
+            f"CE_Exit={exit_ce:.2f}, PE_Exit={exit_pe:.2f}"
+        )
 
     # If no entry, print and still export CSV
     if entry_index is None:
