@@ -108,6 +108,7 @@ def run_vwap_strangle_strategy_for_day(
         expiry_str: str | None = None,
         stop_loss_pct: float = 0.70,
         absolute_stop_loss: float = 2000.0,
+        take_profit_points: float = 1100.0,
         export_csv: bool = True,
 ):
     """
@@ -154,7 +155,9 @@ def run_vwap_strangle_strategy_for_day(
             total_pnl = ((entry_ce - ce_p) + (entry_pe - pe_p)) * LOT_SIZE
             
             temp_exit_reason = None
-            if ce_p >= ce_stop or pe_p >= pe_stop:
+            if total_pnl >= take_profit_points:
+                temp_exit_reason = "TAKE_PROFIT"
+            elif ce_p >= ce_stop or pe_p >= pe_stop:
                 temp_exit_reason = "STOP_LOSS_PCT"
             elif total_pnl <= -absolute_stop_loss:
                 temp_exit_reason = "STOP_LOSS_ABS"
