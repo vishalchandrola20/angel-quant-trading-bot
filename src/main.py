@@ -1,7 +1,7 @@
 # src/main.py
 import argparse
 import time as time_module # Import time_module for sleep
-from datetime import datetime, time # Import time from datetime
+from datetime import datetime, date, time # Import time from datetime
 
 from src.data_pipeline.option_chain import fetch_and_save
 from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
@@ -10,7 +10,7 @@ from src.api.smartapi_client import AngelAPI # Import AngelAPI
 from src.market.contracts import find_nifty_option # Import find_nifty_option
 
 
-from src.backtest.vwap_ce_pe_strategy import run_vwap_strangle_strategy_for_day
+from src.backtest.vwap_ce_pe_strategy import run_iron_condor_strategy_for_day, run_vwap_strangle_strategy_for_day
 from src.backtest.vwap_straddle_strategy import run_vwap_straddle_strategy_for_day
 
 
@@ -34,7 +34,7 @@ def main():
             "backtest_ce_pe_intraday",
             "backtest_vwap_strangle",
             "backtest_vwap_straddle",
-            "backtest_vwap_strangle_5_percent",
+            "backtest_iron_condor",
             "calculate_vwap_until", # New task
         ],
         default="option_chain",
@@ -106,98 +106,111 @@ def main():
             stop_loss_pct=0.70,
             export_csv=True,
     )
+
+    elif args.task == "backtest_iron_condor":
+        if not args.date:
+            raise SystemExit("--date is required for backtest_iron_condor")
+        trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+        expiry_str = args.expiry or None
+
+        run_iron_condor_strategy_for_day(
+            trading_date=trading_date,
+            bar_interval="ONE_MINUTE",
+            expiry_str=expiry_str,
+            absolute_stop_loss=4000.0,
+            take_profit_points=2250.0,
+            export_csv=True,
+        )
     
     elif args.task == "calculate_vwap_until":
-        if not args.date:
-            raise SystemExit("--date is required for calculate_vwap_until")
-        if not args.time:
-            raise SystemExit("--time is required for calculate_vwap_until (format HH:MM)")
-
+        if not args.date or not args.time:
+            raise SystemExit("--date and --time are required for calculate_vwap_until")
+        
         trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
         target_time = datetime.strptime(args.time, "%H:%M").time()
         target_dt = datetime.combine(trading_date, target_time)
 
-        # Determine initial strikes
         first15_close = get_nifty_first_15m_close(trading_date)
         strikes_info = get_single_ce_pe_strikes(first15_close)
-        ce_strike, pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
+        short_ce_strike, short_pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
+        long_ce_strike = short_ce_strike + 8 * 50
+        long_pe_strike = short_pe_strike - 8 * 50
 
-        # Resolve contracts
         expiry_str = args.expiry or None
-        ce_contract = find_nifty_option(ce_strike, "CE", expiry_str, trading_date)
-        pe_contract = find_nifty_option(pe_strike, "PE", expiry_str, trading_date)
+        short_ce_contract = find_nifty_option(short_ce_strike, "CE", expiry_str, trading_date)
+        short_pe_contract = find_nifty_option(short_pe_strike, "PE", expiry_str, trading_date)
+        long_ce_contract = find_nifty_option(long_ce_strike, "CE", expiry_str, trading_date)
+        long_pe_contract = find_nifty_option(long_pe_strike, "PE", expiry_str, trading_date)
 
         api = AngelAPI()
         api.login()
-        time_module.sleep(1) # Wait after login
-        if api.mock:
-            raise RuntimeError("AngelAPI in MOCK mode; cannot fetch real data for VWAP calculation.")
+        time_module.sleep(1)
 
         start_of_day = datetime.combine(trading_date, time(9, 15))
 
-        # Fetch historical candles up to target_dt
-        ce_hist_res = api.connection.getCandleData({
-            "exchange": ce_contract.exchange,
-            "symboltoken": ce_contract.token,
-            "interval": "ONE_MINUTE",
-            "fromdate": start_of_day.strftime("%Y-%m-%d %H:%M"),
-            "todate": target_dt.strftime("%Y-%m-%d %H:%M"),
-        })
-        pe_hist_res = api.connection.getCandleData({
-            "exchange": pe_contract.exchange,
-            "symboltoken": pe_contract.token,
-            "interval": "ONE_MINUTE",
-            "fromdate": start_of_day.strftime("%Y-%m-%d %H:%M"),
-            "todate": target_dt.strftime("%Y-%m-%d %H:%M"),
-        })
+        def get_bars(contract):
+            res = api.connection.getCandleData({"exchange": contract.exchange, "symboltoken": contract.token, "interval": "ONE_MINUTE", "fromdate": start_of_day.strftime("%Y-%m-%d %H:%M"), "todate": target_dt.strftime("%Y-%m-%d %H:%M")})
+            return res.get("data") or []
 
-        ce_hist_bars = ce_hist_res.get("data") or []
-        pe_hist_bars = pe_hist_res.get("data") or []
+        short_ce_bars = get_bars(short_ce_contract)
+        time_module.sleep(1)
+        short_pe_bars = get_bars(short_pe_contract)
+        time_module.sleep(1)
+        long_ce_bars = get_bars(long_ce_contract)
+        time_module.sleep(1)
+        long_pe_bars = get_bars(long_pe_contract)
 
-        if not ce_hist_bars or not pe_hist_bars:
-            print(f"No historical data found for {trading_date} up to {args.time}.")
+        if not all([short_ce_bars, short_pe_bars, long_ce_bars, long_pe_bars]):
+            print(f"No historical data found for one or more legs on {trading_date} up to {args.time}.")
             return
 
-        cum_pv = 0.0
-        cum_vol = 0.0
+        cum_pv_ohlc4, cum_vol_ohlc4 = 0.0, 0.0
+        cum_pv_close, cum_vol_close = 0.0, 0.0
+        cum_pv_hlc3, cum_vol_hlc3 = 0.0, 0.0
 
-        print(f"\n--- VWAP Calculation (OHLC/4) for {trading_date} up to {args.time} ---")
-        header = (
-            f"{'Time':<8} | {'CE_O':>7} {'CE_H':>7} {'CE_L':>7} {'CE_C':>7} {'CE_V':>10} | "
-            f"{'PE_O':>7} {'PE_H':>7} {'PE_L':>7} {'PE_C':>7} {'PE_V':>10} | "
-            f"{'OHLC4':>10} {'VWAP':>10}"
-        )
+        print(f"\n--- Iron Condor VWAP Comparison for {trading_date} up to {args.time} ---")
+        header = f"{'Time':<8} | {'Net Credit Close':>18} {'OHLC4_VWAP':>12} {'CLOSE_VWAP':>12} {'HLC3_VWAP':>12}"
         print(header)
         print("-" * len(header))
 
-        for ce_bar, pe_bar in zip(ce_hist_bars, pe_hist_bars):
-            bar_time = datetime.strptime(ce_bar[0], "%Y-%m-%dT%H:%M:%S%z").strftime("%H:%M")
+        for short_ce, short_pe, long_ce, long_pe in zip(short_ce_bars, short_pe_bars, long_ce_bars, long_pe_bars):
+            bar_time = datetime.strptime(short_ce[0], "%Y-%m-%dT%H:%M:%S%z").strftime("%H:%M")
+            
+            short_ce_o, short_ce_h, short_ce_l, short_ce_c, short_ce_v = [float(x or 0) for x in short_ce[1:]]
+            short_pe_o, short_pe_h, short_pe_l, short_pe_c, short_pe_v = [float(x or 0) for x in short_pe[1:]]
+            long_ce_o, long_ce_h, long_ce_l, long_ce_c, long_ce_v = [float(x or 0) for x in long_ce[1:]]
+            long_pe_o, long_pe_h, long_pe_l, long_pe_c, long_pe_v = [float(x or 0) for x in long_pe[1:]]
 
-            ce_open, ce_high, ce_low, ce_close, ce_vol = float(ce_bar[1]), float(ce_bar[2]), float(ce_bar[3]), float(ce_bar[4]), float(ce_bar[5] or 0)
-            pe_open, pe_high, pe_low, pe_close, pe_vol = float(pe_bar[1]), float(pe_bar[2]), float(pe_bar[3]), float(pe_bar[4]), float(pe_bar[5] or 0)
+            net_credit_open = (short_ce_o + short_pe_o) - (long_ce_o + long_pe_o)
+            net_credit_high = (short_ce_h + short_pe_h) - (long_ce_l + long_pe_l)
+            net_credit_low = (short_ce_l + short_pe_l) - (long_ce_h + long_pe_h)
+            net_credit_close = (short_ce_c + short_pe_c) - (long_ce_c + long_pe_c)
+            
+            combined_vol = short_ce_v + short_pe_v + long_ce_v + long_pe_v
+            
+            # OHLC4 VWAP
+            ohlc4_price = (net_credit_open + net_credit_high + net_credit_low + net_credit_close) / 4
+            cum_pv_ohlc4 += ohlc4_price * combined_vol
+            cum_vol_ohlc4 += combined_vol
+            ohlc4_vwap = cum_pv_ohlc4 / cum_vol_ohlc4 if cum_vol_ohlc4 > 0 else ohlc4_price
 
-            combined_open = ce_open + pe_open
-            combined_high = ce_high + pe_high
-            combined_low = ce_low + pe_low
-            combined_close = ce_close + pe_close
-            combined_vol = ce_vol + pe_vol
+            # Close VWAP
+            cum_pv_close += net_credit_close * combined_vol
+            cum_vol_close += combined_vol
+            close_vwap = cum_pv_close / cum_vol_close if cum_vol_close > 0 else net_credit_close
 
-            ohlc4_price = (combined_open + combined_high + combined_low + combined_close) / 4
-            price_volume = ohlc4_price * combined_vol
+            # HLC3 VWAP
+            hlc3_price = (net_credit_high + net_credit_low + net_credit_close) / 3
+            cum_pv_hlc3 += hlc3_price * combined_vol
+            cum_vol_hlc3 += combined_vol
+            hlc3_vwap = cum_pv_hlc3 / cum_vol_hlc3 if cum_vol_hlc3 > 0 else hlc3_price
 
-            cum_pv += price_volume
-            cum_vol += combined_vol
-
-            vwap = cum_pv / cum_vol if cum_vol > 0 else ohlc4_price
-
-            print(
-                f"{bar_time:<8} | {ce_open:>7.2f} {ce_high:>7.2f} {ce_low:>7.2f} {ce_close:>7.2f} {ce_vol:>10.0f} | "
-                f"{pe_open:>7.2f} {pe_high:>7.2f} {pe_low:>7.2f} {pe_close:>7.2f} {pe_vol:>10.0f} | "
-                f"{ohlc4_price:>10.2f} {vwap:>10.2f} {combined_close:>10.2f}"
-            )
+            print(f"{bar_time:<8} | {net_credit_close:>18.2f} {ohlc4_vwap:>12.2f} {close_vwap:>12.2f} {hlc3_vwap:>12.2f}")
 
         print("-" * len(header))
-        print(f"Final VWAP at {args.time}: {vwap:.2f}")
+        print(f"Final OHLC4 VWAP at {args.time}: {ohlc4_vwap:.2f}")
+        print(f"Final Close VWAP at {args.time}: {close_vwap:.2f}")
+        print(f"Final HLC3 VWAP at {args.time}: {hlc3_vwap:.2f}")
 
 
 if __name__ == "__main__":

@@ -52,9 +52,11 @@ class StrangleLive:
             self,
             trading_date: date | None = None,
             expiry: str | None = None,
+            take_profit_points: float = 1200.0,
     ):
         self.trading_date = trading_date or date.today()
         self.expiry = expiry
+        self.take_profit_points = take_profit_points
 
         self.api = AngelAPI()
         self.api.login()
@@ -382,13 +384,7 @@ class StrangleLive:
 
         if ce_ltp is None or pe_ltp is None: return
 
-        # For live ticks, we use LTP as a proxy for the bar's price
-        # The historical pre-fill uses OHLC4, but live ticks are just LTP.
-        # We use sum_price (CE LTP + PE LTP) for the current tick's price component.
         sum_price = ce_ltp + pe_ltp
-        
-        # The volume for a live tick is the trade volume, not the cumulative bar volume
-        # We use updated_vol which comes from the tick itself
         price_volume = sum_price * updated_vol
         
         self.cum_pv += price_volume
@@ -405,7 +401,7 @@ class StrangleLive:
                 if sum_price <= vwap:
                     log.info(f"{Fore.YELLOW}event=ENTRY_TRIGGERED | price={sum_price:.2f} <= vwap={vwap:.2f}. Executing entry.")
                     self._execute_entry(sum_price, vwap)
-        else: # In position, check for P&L and SL
+        else:
             entry_ce = self.entry_info.get("ce_entry", 0)
             entry_pe = self.entry_info.get("pe_entry", 0)
             pnl_ce = (entry_ce - ce_ltp) * self.NIFTY_LOT_SIZE
@@ -419,7 +415,9 @@ class StrangleLive:
             ce_stop_price = getattr(self, "ce_stop", float("inf"))
             pe_stop_price = getattr(self, "pe_stop", float("inf"))
 
-            if ce_ltp >= ce_stop_price or pe_ltp >= pe_stop_price:
+            if total_pnl >= self.take_profit_points:
+                self._execute_exit(exit_reason="TAKE_PROFIT")
+            elif ce_ltp >= ce_stop_price or pe_ltp >= pe_stop_price:
                 reason = "CE_SL_HIT" if ce_ltp >= ce_stop_price else "PE_SL_HIT"
                 log.info(f"{Fore.RED}event=EXIT_SL | {reason}. Exiting position.")
                 self._execute_exit(exit_reason=reason)
