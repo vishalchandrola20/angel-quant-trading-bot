@@ -71,7 +71,7 @@ def _fetch_intraday_bars_for_iron_condor(
         expiry_str: str | None = None,
 ) -> tuple[list[Bar], str, str, str, str]:
     first15_close = get_nifty_first_15m_close(trading_date)
-    strikes_info = get_single_ce_pe_strikes(first15_close)
+    strikes_info = get_single_ce_pe_strikes(first15_close,trading_date)
     
     short_ce_strike, short_pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
     long_ce_strike = short_ce_strike + 8 * 50
@@ -123,12 +123,14 @@ def _fetch_intraday_bars_for_iron_condor(
 def run_iron_condor_strategy_for_day(
         trading_date: date,
         bar_interval: str = "ONE_MINUTE",
+        LOT_SIZE=150,
         expiry_str: str | None = None,
-        stop_loss_pct: float = 0.70,
-        absolute_stop_loss: float = 2000.0,
-        take_profit_points: float = 3000.0,
-        export_csv: bool = True,
-        LOT_SIZE=150):
+        stop_loss_pct: float = 0.90,
+        absolute_stop_loss: float = LOT_SIZE * 25,
+        take_profit_points: float = LOT_SIZE * 15,
+        export_csv: bool = True):
+    log.info("--- Iron Condor Strategy ---")
+    log.info(f"trading_date={trading_date}")
     bars, short_ce_sym, short_pe_sym, long_ce_sym, long_pe_sym = _fetch_intraday_bars_for_iron_condor(trading_date, bar_interval, expiry_str)
 
     cum_pv, cum_vol = 0.0, 0.0
