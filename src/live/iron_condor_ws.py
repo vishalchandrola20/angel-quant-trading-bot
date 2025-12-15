@@ -48,6 +48,9 @@ except Exception as e:
 
 class IronCondorLive:
     NIFTY_LOT_SIZE = 150
+    NIFTY_TOKEN = "99926000"
+    NIFTY_EXCHANGE = "NSE"
+
 
     def __init__(
             self,
@@ -132,7 +135,7 @@ class IronCondorLive:
 
     def prepare_contracts(self):
         first15 = get_nifty_first_15m_close(self.trading_date)
-        strikes_info = get_single_ce_pe_strikes(first15)
+        strikes_info = get_single_ce_pe_strikes(first15, trading_date=self.trading_date)
         
         short_ce_strike, short_pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
         long_ce_strike = short_ce_strike + 8 * 50
@@ -181,7 +184,7 @@ class IronCondorLive:
 
     def _check_and_resume_position(self):
         log.info("Checking for existing open positions...")
-        #self.closed_pnl = self._calculate_closed_pnl()
+        self.closed_pnl = self._calculate_closed_pnl()
         log.info(f"Found initial closed PNL: {self.closed_pnl:.2f}")
 
         open_positions = self.api.get_open_positions()
@@ -192,6 +195,7 @@ class IronCondorLive:
         s_ce, s_pe, l_ce, l_pe = None, None, None, None
         for pos in open_positions:
             symbol = pos.get("tradingsymbol")
+            log.info(f"Checking position: {symbol}, sellqty: {pos.get('sellqty')}, buyqty: {pos.get('buyqty')}")
             if int(pos.get('sellqty', 0)) > int(pos.get('buyqty', 0)): # Net short
                 if symbol == self.short_ce_contract.symbol: s_ce = pos
                 elif symbol == self.short_pe_contract.symbol: s_pe = pos
@@ -218,14 +222,20 @@ class IronCondorLive:
 
     def _calculate_closed_pnl(self) -> float:
         trade_book = self.api.get_trade_book()
-        log.info(trade_book)
         if not trade_book:
             return 0.0
 
         pnl = 0.0
+        condor_symbols = {
+            self.short_ce_contract.symbol,
+            self.short_pe_contract.symbol,
+            self.long_ce_contract.symbol,
+            self.long_pe_contract.symbol,
+        }
         trades = defaultdict(list)
         for trade in trade_book:
-            trades[trade['tradingsymbol']].append(trade)
+            if trade['tradingsymbol'] in condor_symbols:
+                trades[trade['tradingsymbol']].append(trade)
 
         for symbol, symbol_trades in trades.items():
             buys = sorted([t for t in symbol_trades if t['transactiontype'] == 'BUY'], key=lambda x: x['fillid'])
@@ -234,7 +244,7 @@ class IronCondorLive:
             while buys and sells:
                 buy = buys.pop(0)
                 sell = sells.pop(0)
-                pnl += (float(sell['fillprice']) - float(buy['fillprice'])) * int(buy['fillquantity'])
+                pnl += (float(sell['fillprice']) - float(buy['fillprice'])) * int(buy['fillsize'])
         
         return pnl
 
@@ -289,25 +299,28 @@ class IronCondorLive:
             sc_id = self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.NIFTY_LOT_SIZE, "SELL")
             sp_id = self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.NIFTY_LOT_SIZE, "SELL")
         except Exception as e:
-            log.error(f"Failed to place one or both SELL orders: {e}. Exiting bought legs.")
+            log.error(f"Failed to place one or both SELL orders: {e}. Exiting bought legs."); 
             self._execute_exit(exit_reason="SELL_LEG_FAILED"); return
 
         sc_details = self._poll_order_status(sc_id)
         sp_details = self._poll_order_status(sp_id)
 
         if not sc_details or not sp_details:
-            log.error("One or both SELL orders failed. Exiting all legs.")
+            log.error("One or both SELL orders failed. Exiting all legs."); 
             self._execute_exit(exit_reason="PARTIAL_SELL_FAILED"); return
+
+        nifty_entry_price = self.api.get_ltp(self.NIFTY_EXCHANGE, "NIFTY", self.NIFTY_TOKEN)
 
         self.in_position = True
         self.entry_info = {
             "ts": datetime.now().isoformat(),
             "short_ce_entry": float(sc_details['averageprice']), "short_pe_entry": float(sp_details['averageprice']),
             "long_ce_entry": float(lc_details['averageprice']), "long_pe_entry": float(lp_details['averageprice']),
+            "nifty_entry_price": nifty_entry_price,
         }
         self.short_ce_stop = self.entry_info["short_ce_entry"] * 1.70
         self.short_pe_stop = self.entry_info["short_pe_entry"] * 1.70
-        log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | Iron Condor position entered.")
+        log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | Iron Condor position entered at NIFTY {nifty_entry_price}.")
 
     def _execute_exit(self, exit_reason="STRATEGY_EXIT"):
         log.info(f"event=ORDER_EXIT_INIT | Triggered by: {exit_reason}")
@@ -331,8 +344,9 @@ class IronCondorLive:
         s_pe_ltp = self.latest_ltp.get(self.short_pe_contract.token)
         l_ce_ltp = self.latest_ltp.get(self.long_ce_contract.token)
         l_pe_ltp = self.latest_ltp.get(self.long_pe_contract.token)
+        nifty_ltp = self.latest_ltp.get(self.NIFTY_TOKEN)
 
-        if not all([s_ce_ltp, s_pe_ltp, l_ce_ltp, l_pe_ltp]): return
+        if not all([s_ce_ltp, s_pe_ltp, l_ce_ltp, l_pe_ltp, nifty_ltp]): return
 
         net_credit = (s_ce_ltp + s_pe_ltp) - (l_ce_ltp + l_pe_ltp)
         price_volume = net_credit * updated_vol
@@ -355,8 +369,12 @@ class IronCondorLive:
             open_pnl = (entry_net_credit - net_credit) * self.NIFTY_LOT_SIZE
             total_pnl = open_pnl + self.closed_pnl
             
+            nifty_change = nifty_ltp - self.entry_info.get("nifty_entry_price", nifty_ltp)
+            nifty_color = Fore.GREEN if nifty_change >= 0 else Fore.RED
+            nifty_str = f"NIFTY: {nifty_ltp:.2f} ({nifty_color}{nifty_change:+.2f}{Style.RESET_ALL})"
+
             pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-            log.info(f"event=PNL_UPDATE | Open PNL: {open_pnl:+.2f}, Closed PNL: {self.closed_pnl:+.2f}, Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL}")
+            log.info(f"event=PNL_UPDATE | Open PNL: {open_pnl:+.2f}, Closed PNL: {self.closed_pnl:+.2f}, Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
 
             if total_pnl >= self.take_profit_points:
                 self._execute_exit(exit_reason="TAKE_PROFIT")
@@ -379,7 +397,7 @@ class IronCondorLive:
             token_list = [{"exchangeType": 2, "tokens": [
                 self.short_ce_contract.token, self.short_pe_contract.token,
                 self.long_ce_contract.token, self.long_pe_contract.token
-            ]}]
+            ]}, {"exchangeType": 1, "tokens": [self.NIFTY_TOKEN]}]
             
             def on_open(wsapp):
                 log.info("event=WS_OPEN | Subscribing to tokens: %s", token_list)

@@ -6,7 +6,7 @@ import time
 from datetime import date, datetime, time as dt_time
 
 from src.api.smartapi_client import AngelAPI
-from src.market.contracts import find_nifty_option
+from src.market.contracts import find_nifty_option, get_next_nifty_expiry
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,45 @@ def ceil_to_50(spot: float) -> int:
     """Round up to nearest 50."""
     return int(math.ceil(spot / 50.0) * 50)
 
+def _adjust_strikes_for_delta(trading_date: date, ce_strike: int, pe_strike: int) -> tuple[int, int]:
+    try:
+        api = AngelAPI()
+        api.login()
+        time.sleep(1)
+
+        expiry_str_for_greeks = get_next_nifty_expiry(trading_date)
+        greeks_data = api.get_option_greeks("NIFTY", expiry_date=expiry_str_for_greeks)
+        
+        if greeks_data and greeks_data.get("status"):
+            greeks_list = greeks_data.get("data", [])
+            
+            # Convert strikePrice and delta to numeric types for proper sorting and comparison
+            for item in greeks_list:
+                item["strikePrice"] = int(float(item.get("strikePrice", 0)))
+                item["delta"] = float(item.get("delta", 0))
+
+            ce_options = sorted([item for item in greeks_list if item.get("optionType") == "CE"], key=lambda x: x.get("strikePrice", 0))
+            pe_options = sorted([item for item in greeks_list if item.get("optionType") == "PE"], key=lambda x: x.get("strikePrice", 0), reverse=True)
+
+            for option in ce_options:
+                if option.get("strikePrice", 0) >= ce_strike and option.get("delta", 1) <= 0.25:
+                    ce_strike = option["strikePrice"]
+                    log.info(f"Found CE strike {ce_strike} with delta {option['delta']:.2f}")
+                    break
+            
+            for option in pe_options:
+                if option.get("strikePrice", 0) <= pe_strike and option.get("delta", -1) >= -0.25:
+                    pe_strike = option["strikePrice"]
+                    log.info(f"Found PE strike {pe_strike} with delta {option['delta']:.2f}")
+                    break
+        else:
+            log.error(f"Failed to fetch greeks data for delta selection: {greeks_data}")
+
+    except Exception as e:
+        log.error(f"Could not perform delta-based strike selection: {e}")
+    
+    return ce_strike, pe_strike
+
 
 def get_single_ce_pe_strikes(spot: float, trading_date: date | None = None) -> dict:
     """
@@ -57,6 +96,9 @@ def get_single_ce_pe_strikes(spot: float, trading_date: date | None = None) -> d
     pe_strike = pe_base - 100
 
     log.info(f"Initial strikes: CE={ce_strike}, PE={pe_strike}")
+
+    ce_strike, pe_strike = _adjust_strikes_for_delta(trading_date, ce_strike, pe_strike)
+
 
     # --- Price-based Adjustment ---
     try:

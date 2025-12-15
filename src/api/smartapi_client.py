@@ -10,6 +10,8 @@ import yaml
 import pyotp
 import logging
 import uuid
+import json
+import requests
 
 try:
     from SmartApi import SmartConnect
@@ -158,7 +160,7 @@ class AngelAPI:
         
         try:
             response = self.connection.position()
-            log.info(f"Open positions response: {response}")
+
             if response and response.get("status"):
                 return response.get("data")
             else:
@@ -187,6 +189,21 @@ class AngelAPI:
             log.exception("Exception while fetching trade book.")
             return None
 
+    def get_option_greeks(self, name: str, expiry_date: str) -> dict | None:
+        """
+        Fetches option greeks using the library's _postRequest method.
+        """
+        if self.mock:
+            log.warning("MOCK mode, cannot fetch greeks.")
+            return None
+        try:
+            payload = {"name": name, "expirydate": expiry_date}
+            response = self.connection._postRequest("api.optionGreek", payload)
+            return response
+        except Exception as e:
+            log.exception(f"Exception while fetching option greeks: {e}")
+            return None
+
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str | int) -> float:
         """
         Fetch LTP using SmartAPI ltpData for a single instrument.
@@ -211,16 +228,16 @@ if __name__ == "__main__":
     api.login()
     if not api.mock:
         try:
-            positions = api.get_open_positions()
-            print("Open Positions:", positions)
-            
-            order_book = api.get_order_book()
-            print("Order Book:", order_book)
-
-            trade_book = api.get_trade_book()
-            print("Trade Book:", trade_book)
+            # Example usage for greeks
+            greeks = api.get_option_greeks(name="NIFTY", expiry_date="18DEC2025")
+            if greeks:
+                print(f"Option Greeks for NIFTY 18DEC2025 (found {len(greeks.get('data', []))}):")
+                # Print greeks for a specific strike if found
+                for greek in greeks.get('data', []):
+                    if greek.get("strikePrice") == 26000:
+                        print(greek)
 
         except Exception as e:
             print(e)
     else:
-        print("Running in MOCK mode. Cannot place real orders.")
+        print("Running in MOCK mode.")
