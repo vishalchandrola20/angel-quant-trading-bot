@@ -168,6 +168,25 @@ class AngelAPI:
             log.exception("Exception while fetching open positions.")
             return None
 
+    def get_trade_book(self) -> list[dict] | None:
+        """
+        Fetches the trade book for the day.
+        """
+        if self.mock:
+            log.info("MOCK get_trade_book returning empty list.")
+            return []
+        
+        try:
+            response = self.connection.tradeBook()
+            if response and response.get("status"):
+                return response.get("data")
+            else:
+                log.error(f"Failed to fetch trade book: {response.get('message', 'Unknown error')}")
+                return None
+        except Exception as e:
+            log.exception("Exception while fetching trade book.")
+            return None
+
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str | int) -> float:
         """
         Fetch LTP using SmartAPI ltpData for a single instrument.
@@ -197,6 +216,9 @@ if __name__ == "__main__":
             
             order_book = api.get_order_book()
             print("Order Book:", order_book)
+
+            trade_book = api.get_trade_book()
+            print("Trade Book:", trade_book)
 
         except Exception as e:
             print(e)

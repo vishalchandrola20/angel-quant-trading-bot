@@ -73,6 +73,8 @@ def analyze_single_day(csv_path: Path) -> dict | None:
     max_loss_day_time = max_loss_day_row["ts"]
     max_loss_day = max_loss_day_row["pnl_bar_day"]
 
+    first_hit = "PROFIT" if max_profit_day_time < max_loss_day_time else "LOSS"
+
     summary = {
         "date": trading_date,
         "entry_time": entry_time,
@@ -86,6 +88,7 @@ def analyze_single_day(csv_path: Path) -> dict | None:
         "max_profit_time_during_day": max_profit_day_time,
         "max_loss_during_day": max_loss_day,
         "max_loss_time_during_day": max_loss_day_time,
+        "first_hit": first_hit,
     }
 
     return summary
@@ -143,14 +146,18 @@ def main():
         pnl_str = f"{pnl_color}{pnl_val:+.2f}{Style.RESET_ALL}"
 
         during_trade_str = f"{row['max_profit_during_trade']:+.2f} / {row['max_loss_during_trade']:+.2f}"
-        during_day_str = f"{row['max_profit_during_day']:+.2f} / {row['max_loss_during_day']:+.2f}"
+        
+        day_pnl_str = f"{row['max_profit_during_day']:+.2f} / {row['max_loss_during_day']:+.2f}"
+        day_pnl_color = Fore.GREEN if row['first_hit'] == 'PROFIT' else Fore.RED
+        day_pnl_str_colored = f"{day_pnl_color}{day_pnl_str}{Style.RESET_ALL}"
+
 
         print(
             f"{str(row['date']):<12}"
             f"{pnl_str:>18}" # Adjusted padding for color codes
             f"{during_trade_str:>20}"
             f"{row['max_profit_time_during_trade'].strftime('%H:%M'):>12}"
-            f"{during_day_str:>20}"
+            f"{day_pnl_str_colored:>30}" # Adjusted padding for color codes
             f"{row['max_profit_time_during_day'].strftime('%H:%M'):>12}"
             f"{row['max_loss_time_during_day'].strftime('%H:%M'):>12}"
             f"{row['entry_time'].strftime('%H:%M'):>8}"

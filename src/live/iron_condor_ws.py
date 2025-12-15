@@ -12,6 +12,7 @@ import time
 from datetime import datetime, date, time as dt_time
 from pathlib import Path
 from typing import Dict, Any
+from collections import defaultdict
 
 from colorama import Fore, Style, init as colorama_init
 
@@ -52,13 +53,14 @@ class IronCondorLive:
             self,
             trading_date: date | None = None,
             expiry: str | None = None,
-            take_profit_points: float = 1200.0,
-            absolute_stop_loss: float = 4000.0,
+            take_profit_per_lot: float = 9.0,
+            absolute_stop_loss_per_lot: float = 26.67,
     ):
         self.trading_date = trading_date or date.today()
         self.expiry = expiry
-        self.take_profit_points = take_profit_points
-        self.absolute_stop_loss = absolute_stop_loss
+        
+        self.take_profit_points = take_profit_per_lot * self.NIFTY_LOT_SIZE
+        self.absolute_stop_loss = absolute_stop_loss_per_lot * self.NIFTY_LOT_SIZE
 
         self.api = AngelAPI()
         self.api.login()
@@ -76,13 +78,17 @@ class IronCondorLive:
         self.in_position = False
         self.entry_info: Dict[str, Any] = {}
         self.exit_info: Dict[str, Any] = {}
+        self.closed_pnl = 0.0
         self.ws = None
 
         self.events_dir = Path("data/live")
         self.events_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.events_dir / f"iron_condor_events_{self.trading_date}.csv"
         self._ensure_csv()
-        log.info(f"Strategy configured with Take Profit: {self.take_profit_points}, Absolute SL: {self.absolute_stop_loss}")
+        log.info(
+            f"Strategy configured with TP: {self.take_profit_points:.2f} ({take_profit_per_lot}/lot), "
+            f"Abs SL: {self.absolute_stop_loss:.2f} ({absolute_stop_loss_per_lot}/lot)"
+        )
 
 
     def _ensure_csv(self):
@@ -175,6 +181,9 @@ class IronCondorLive:
 
     def _check_and_resume_position(self):
         log.info("Checking for existing open positions...")
+        #self.closed_pnl = self._calculate_closed_pnl()
+        log.info(f"Found initial closed PNL: {self.closed_pnl:.2f}")
+
         open_positions = self.api.get_open_positions()
         if not open_positions:
             log.info("No open positions found.")
@@ -201,11 +210,33 @@ class IronCondorLive:
                 "long_ce_entry": float(l_ce['buyavgprice']),
                 "long_pe_entry": float(l_pe['buyavgprice']),
             }
-            self.short_ce_stop = self.entry_info["short_ce_entry"] * 3
-            self.short_pe_stop = self.entry_info["short_pe_entry"] * 2
+            self.short_ce_stop = self.entry_info["short_ce_entry"] * 2.20
+            self.short_pe_stop = self.entry_info["short_pe_entry"] * 2.20
             log.info(f"Resumed with entry prices and SLs.")
         else:
             log.info("No complete Iron Condor position found to resume.")
+
+    def _calculate_closed_pnl(self) -> float:
+        trade_book = self.api.get_trade_book()
+        log.info(trade_book)
+        if not trade_book:
+            return 0.0
+
+        pnl = 0.0
+        trades = defaultdict(list)
+        for trade in trade_book:
+            trades[trade['tradingsymbol']].append(trade)
+
+        for symbol, symbol_trades in trades.items():
+            buys = sorted([t for t in symbol_trades if t['transactiontype'] == 'BUY'], key=lambda x: x['fillid'])
+            sells = sorted([t for t in symbol_trades if t['transactiontype'] == 'SELL'], key=lambda x: x['fillid'])
+
+            while buys and sells:
+                buy = buys.pop(0)
+                sell = sells.pop(0)
+                pnl += (float(sell['fillprice']) - float(buy['fillprice'])) * int(buy['fillquantity'])
+        
+        return pnl
 
     def _on_tick(self, payload: dict):
         try:
@@ -258,14 +289,14 @@ class IronCondorLive:
             sc_id = self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.NIFTY_LOT_SIZE, "SELL")
             sp_id = self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.NIFTY_LOT_SIZE, "SELL")
         except Exception as e:
-            log.error(f"Failed to place one or both SELL orders: {e}. Exiting bought legs."); 
+            log.error(f"Failed to place one or both SELL orders: {e}. Exiting bought legs.")
             self._execute_exit(exit_reason="SELL_LEG_FAILED"); return
 
         sc_details = self._poll_order_status(sc_id)
         sp_details = self._poll_order_status(sp_id)
 
         if not sc_details or not sp_details:
-            log.error("One or both SELL orders failed. Exiting all legs."); 
+            log.error("One or both SELL orders failed. Exiting all legs.")
             self._execute_exit(exit_reason="PARTIAL_SELL_FAILED"); return
 
         self.in_position = True
@@ -286,7 +317,9 @@ class IronCondorLive:
         self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.NIFTY_LOT_SIZE, "SELL")
         
         self.in_position = False
-        log.info(f"event=EXIT_CONFIRMED | All 4 exit orders placed. Reason={exit_reason}")
+        time.sleep(2) # Give time for orders to be updated in tradebook
+        self.closed_pnl = self._calculate_closed_pnl()
+        log.info(f"event=EXIT_CONFIRMED | All 4 exit orders placed. New Closed PNL: {self.closed_pnl:.2f}. Reason={exit_reason}")
         self._close_ws()
 
     def _process_strategy_on_tick(self, updated_token: str, updated_ltp: float, updated_vol: float):
@@ -318,10 +351,12 @@ class IronCondorLive:
         else:
             entry_net_credit = (self.entry_info['short_ce_entry'] + self.entry_info['short_pe_entry']) - \
                                (self.entry_info['long_ce_entry'] + self.entry_info['long_pe_entry'])
-            total_pnl = (entry_net_credit - net_credit) * self.NIFTY_LOT_SIZE
+            
+            open_pnl = (entry_net_credit - net_credit) * self.NIFTY_LOT_SIZE
+            total_pnl = open_pnl + self.closed_pnl
             
             pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-            log.info(f"event=PNL_UPDATE | Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL}")
+            log.info(f"event=PNL_UPDATE | Open PNL: {open_pnl:+.2f}, Closed PNL: {self.closed_pnl:+.2f}, Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL}")
 
             if total_pnl >= self.take_profit_points:
                 self._execute_exit(exit_reason="TAKE_PROFIT")

@@ -1,7 +1,7 @@
 # src/main.py
 import argparse
 import time as time_module # Import time_module for sleep
-from datetime import datetime, date, time # Import time from datetime
+from datetime import datetime, time # Import time from datetime
 
 from src.data_pipeline.option_chain import fetch_and_save
 from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
@@ -118,7 +118,7 @@ def main():
             bar_interval="ONE_MINUTE",
             expiry_str=expiry_str,
             absolute_stop_loss=4000.0,
-            take_profit_points=2250.0,
+            take_profit_points=1400.0,
             export_csv=True,
         )
     
