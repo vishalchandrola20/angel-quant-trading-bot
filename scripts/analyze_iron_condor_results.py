@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -9,8 +8,7 @@ from colorama import Fore, Style, init as colorama_init
 # Initialize colorama
 colorama_init(autoreset=True)
 
-CONDOR_DIR = Path("data/processed/iron_condor")
-OUT_PATH = Path("data/processed/iron_condor_summary.csv")
+BASE_DIR = Path("data/processed/iron_condor")
 
 
 def analyze_single_day(csv_path: Path) -> dict | None:
@@ -94,17 +92,23 @@ def analyze_single_day(csv_path: Path) -> dict | None:
     return summary
 
 
-def main():
-    if not CONDOR_DIR.exists():
-        print(f"Iron Condor folder not found: {CONDOR_DIR}")
-        sys.exit(1)
+def process_and_display_summary(symbol: str):
+    """
+    Processes all CSVs for a given symbol and prints the summary.
+    """
+    condor_dir = BASE_DIR / symbol
+    out_path = BASE_DIR / f"{symbol}_summary.csv"
 
-    csv_files = sorted(CONDOR_DIR.glob("*.csv"))
+    if not condor_dir.exists():
+        print(f"Directory for {symbol.upper()} not found: {condor_dir}")
+        return
+
+    csv_files = sorted(condor_dir.glob("*.csv"))
     if not csv_files:
-        print(f"No CSV files found in {CONDOR_DIR}")
-        sys.exit(0)
+        print(f"No CSV files found in {condor_dir}")
+        return
 
-    print(f"Found {len(csv_files)} Iron Condor CSVs under {CONDOR_DIR}")
+    print(f"\nFound {len(csv_files)} {symbol.upper()} CSVs under {condor_dir}")
 
     summaries = []
     for csv_path in csv_files:
@@ -116,14 +120,14 @@ def main():
             print(f"Error processing {csv_path.name}: {e}")
 
     if not summaries:
-        print("No valid trades found in any CSVs.")
-        sys.exit(0)
+        print(f"No valid trades found for {symbol.upper()}.")
+        return
 
     summary_df = pd.DataFrame(summaries)
     summary_df.sort_values("date", inplace=True)
 
     # --- Manual Print with Fixed Width and Color ---
-    print("\n=== Iron Condor Strategy Summary ===")
+    print(f"\n=== {symbol.upper()} Iron Condor Strategy Summary ===")
     
     header = (
         f"{'date':<12}"
@@ -171,7 +175,7 @@ def main():
     max_day_loss = summary_df["total_pnl"].min()
     win_rate = (summary_df["total_pnl"] > 0).mean() * 100.0
 
-    print("\n=== Aggregate Stats ===")
+    print(f"\n=== {symbol.upper()} Aggregate Stats ===")
     pnl_color = Fore.GREEN if total_pnl_val >=0 else Fore.RED
     print(f"Total P&L (per lot): {pnl_color}{total_pnl_val:+.2f}{Style.RESET_ALL}")
     print(f"Max single-day profit: {max_day_profit:.2f}")
@@ -179,9 +183,15 @@ def main():
     print(f"Win rate: {win_rate:.1f}%")
 
     # Save the original, unformatted data to CSV
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    summary_df.to_csv(OUT_PATH, index=False)
-    print(f"\nSummary saved to {OUT_PATH}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_df.to_csv(out_path, index=False)
+    print(f"\nSummary for {symbol.upper()} saved to {out_path}")
+
+
+def main():
+    symbols = ["nifty", "sensex"]
+    for symbol in symbols:
+        process_and_display_summary(symbol)
 
 
 if __name__ == "__main__":

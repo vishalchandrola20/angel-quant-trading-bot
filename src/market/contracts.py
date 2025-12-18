@@ -50,14 +50,16 @@ def load_scrip_master(force_download: bool = False) -> list[dict]:
     return data
 
 
-def find_nifty_option(
+def find_option(
+        index_name: str,
         strike: int,
         option_type: str,
         expiry_str: str | None = None,
         trading_date: date | None = None,
 ) -> OptionContract:
     """
-    Find NIFTY option contract in Scrip Master for:
+    Find an option contract in Scrip Master for:
+      - index_name: "NIFTY" or "SENSEX"
       - given strike (e.g. 26350)
       - option_type: "CE" or "PE"
       - expiry_str: exact expiry like '26JUN2029'; if None, auto-select next expiry based on trading_date.
@@ -66,23 +68,29 @@ def find_nifty_option(
     if option_type not in ("CE", "PE"):
         raise ValueError("option_type must be 'CE' or 'PE'")
 
+    index_name = index_name.upper()
+    if index_name not in ["NIFTY", "SENSEX"]:
+        raise ValueError(f"Unsupported index for option lookup: {index_name}")
+
+    options_exchange = "NFO" if index_name == "NIFTY" else "BFO"
+
     if expiry_str is None:
-        expiry_str = get_next_nifty_expiry(trading_date)
+        expiry_str = get_next_expiry(index_name, trading_date)
 
     data = load_scrip_master()
     candidates = []
 
     for row in data:
-        name = row.get("name") or ""
+        row_name = row.get("name") or ""
         exch_seg = row.get("exch_seg") or ""
         instrumenttype = row.get("instrumenttype") or ""
         symbol = row.get("symbol") or ""
         token = row.get("token") or ""
         expiry = row.get("expiry") or ""
 
-        if name != "NIFTY":
+        if row_name != index_name:
             continue
-        if exch_seg != "NFO":
+        if exch_seg != options_exchange:
             continue
         if "OPT" not in instrumenttype.upper():
             continue
@@ -116,20 +124,27 @@ def find_nifty_option(
 
     if not candidates:
         raise RuntimeError(
-            f"No NIFTY option found for strike={strike}, type={option_type}, expiry={expiry_str}"
+            f"No {index_name} option found for strike={strike}, type={option_type}, expiry={expiry_str}"
         )
 
     c = candidates[0]
-    log.info("Resolved %s %s as symbol=%s, token=%s, expiry=%s", c.option_type, c.strike, c.symbol, c.token, c.expiry)
+    log.info("Resolved %s %s %s as symbol=%s, token=%s, expiry=%s", index_name, c.option_type, c.strike, c.symbol, c.token, c.expiry)
     return c
 
-def get_next_nifty_expiry(trading_date: date | None = None) -> str:
+def get_next_expiry(index_name: str, trading_date: date | None = None) -> str:
     """
-    Auto-select next NIFTY option expiry (>= trading_date) from Scrip Master.
+    Auto-select next option expiry (>= trading_date) from Scrip Master for a given index.
+    index_name: "NIFTY" or "SENSEX"
     trading_date: date for which you want to trade/backtest.
                   If None, uses today's date.
     Returns expiry string as in Scrip Master, e.g. '26JUN2029'.
     """
+    index_name = index_name.upper()
+    if index_name not in ["NIFTY", "SENSEX"]:
+        raise ValueError(f"Unsupported index for expiry lookup: {index_name}")
+
+    options_exchange = "NFO" if index_name == "NIFTY" else "BFO"
+
     if trading_date is None:
         trading_date = date.today()
 
@@ -137,9 +152,9 @@ def get_next_nifty_expiry(trading_date: date | None = None) -> str:
     expiries: list[tuple[date, str]] = []
 
     for row in data:
-        if row.get("name") != "NIFTY":
+        if row.get("name") != index_name:
             continue
-        if row.get("exch_seg") != "NFO":
+        if row.get("exch_seg") != options_exchange:
             continue
         instrumenttype = row.get("instrumenttype") or ""
         if "OPT" not in instrumenttype.upper():
@@ -159,9 +174,8 @@ def get_next_nifty_expiry(trading_date: date | None = None) -> str:
             expiries.append((dt, expiry_str))
 
     if not expiries:
-        raise RuntimeError(f"No NIFTY option expiry found on or after {trading_date}")
+        raise RuntimeError(f"No {index_name} option expiry found on or after {trading_date}")
 
     dt, expiry_str = min(expiries, key=lambda x: x[0])
-    log.info("Auto-selected NIFTY expiry %s for trading date %s", expiry_str, trading_date)
+    log.info("Auto-selected %s expiry %s for trading date %s", index_name, expiry_str, trading_date)
     return expiry_str
-

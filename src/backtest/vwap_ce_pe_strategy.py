@@ -7,9 +7,9 @@ from datetime import datetime, date, time
 import time as time_module
 
 from src.api.smartapi_client import AngelAPI
-from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
+from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
 from src.strategy.strike_selection import get_single_ce_pe_strikes
-from src.market.contracts import find_nifty_option
+from src.market.contracts import find_option
 from pathlib import Path
 import csv
 
@@ -17,7 +17,38 @@ import csv
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-LOT_SIZE = 75
+INDEX_CONFIG = {
+    "NIFTY": {
+        "lot_size": 150,
+        "token": "99926000",
+        "exchange": "NSE",
+        "options_exchange": "NFO",
+        "exchange_type": 1,
+        "options_exchange_type": 2,
+        "strike_step": 50,
+        "spot_proximity_exit_points": 40,
+        "take_profit_per_lot": 20.0,
+        "absolute_stop_loss_per_lot": 20.0,
+        "trailing_activation_mtm_per_lot": 8.0, # 1000 / 50 lots
+        "trailing_sl_reversal_pct": 0.70,
+    },
+
+    "SENSEX": {
+        "lot_size": 60,
+        "token": "99919000",
+        "exchange": "BSE",
+        "options_exchange": "BFO",
+        "exchange_type": 3,
+        "options_exchange_type": 4,
+        "strike_step": 100,
+        "spot_proximity_exit_points": 60,
+        "take_profit_per_lot": 50.0,
+        "absolute_stop_loss_per_lot": 50.0,
+        "trailing_activation_mtm_per_lot": 20, # 1000 / 60 lots
+        "trailing_sl_reversal_pct": 0.70,
+    }
+}
+
 
 @dataclass
 class Bar:
@@ -67,22 +98,28 @@ class Bar:
 
 def _fetch_intraday_bars_for_iron_condor(
         trading_date: date,
+        index_name: str = "NIFTY",
         bar_interval: str = "ONE_MINUTE",
         expiry_str: str | None = None,
 ) -> tuple[list[Bar], str, str, str, str]:
-    first15_close = get_nifty_first_15m_close(trading_date)
-    strikes_info = get_single_ce_pe_strikes(first15_close,trading_date)
-    
-    short_ce_strike, short_pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
-    long_ce_strike = short_ce_strike + 8 * 50
-    long_pe_strike = short_pe_strike - 8 * 50
+    index_name = index_name.upper()
+    if index_name not in INDEX_CONFIG:
+        raise ValueError(f"Unsupported index '{index_name}' for backtesting.")
+
+    config = INDEX_CONFIG[index_name]
+    strike_step = config["strike_step"]
+
+    spot, spot_candle_end_time = get_index_first_15m_close(index_name, trading_date)
+    strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, index_name=index_name, trading_date=trading_date, strike_step=strike_step)
+    short_ce_strike, short_pe_strike, long_ce_strike, long_pe_strike = \
+        strikes_info["ce_strike"], strikes_info["pe_strike"], strikes_info["long_ce_strike"], strikes_info["long_pe_strike"]
 
     log.info(f"Strikes: Short CE={short_ce_strike}, Short PE={short_pe_strike}, Long CE={long_ce_strike}, Long PE={long_pe_strike}")
 
-    short_ce_contract = find_nifty_option(short_ce_strike, "CE", expiry_str, trading_date)
-    short_pe_contract = find_nifty_option(short_pe_strike, "PE", expiry_str, trading_date)
-    long_ce_contract = find_nifty_option(long_ce_strike, "CE", expiry_str, trading_date)
-    long_pe_contract = find_nifty_option(long_pe_strike, "PE", expiry_str, trading_date)
+    short_ce_contract = find_option(index_name, short_ce_strike, "CE", expiry_str, trading_date)
+    short_pe_contract = find_option(index_name, short_pe_strike, "PE", expiry_str, trading_date)
+    long_ce_contract = find_option(index_name, long_ce_strike, "CE", expiry_str, trading_date)
+    long_pe_contract = find_option(index_name, long_pe_strike, "PE", expiry_str, trading_date)
 
     api = AngelAPI()
     api.login()
@@ -122,16 +159,23 @@ def _fetch_intraday_bars_for_iron_condor(
 
 def run_iron_condor_strategy_for_day(
         trading_date: date,
+        index_name: str = "NIFTY",
         bar_interval: str = "ONE_MINUTE",
-        LOT_SIZE=150,
         expiry_str: str | None = None,
-        stop_loss_pct: float = 0.90,
-        absolute_stop_loss: float = LOT_SIZE * 25,
-        take_profit_points: float = LOT_SIZE * 15,
         export_csv: bool = True):
     log.info("--- Iron Condor Strategy ---")
     log.info(f"trading_date={trading_date}")
-    bars, short_ce_sym, short_pe_sym, long_ce_sym, long_pe_sym = _fetch_intraday_bars_for_iron_condor(trading_date, bar_interval, expiry_str)
+
+    index_name = index_name.upper()
+    config = INDEX_CONFIG.get(index_name, INDEX_CONFIG["NIFTY"])
+    lot_size = config["lot_size"]
+    absolute_stop_loss = config["absolute_stop_loss_per_lot"] * lot_size
+    take_profit_points = config["take_profit_per_lot"] * lot_size
+    trailing_activation_mtm = config["trailing_activation_mtm_per_lot"] * lot_size
+    trailing_sl_reversal_pct = config["trailing_sl_reversal_pct"]
+
+
+    bars, short_ce_sym, short_pe_sym, long_ce_sym, long_pe_sym = _fetch_intraday_bars_for_iron_condor(trading_date, index_name, bar_interval, expiry_str)
 
     cum_pv, cum_vol = 0.0, 0.0
     in_position = False
@@ -141,6 +185,8 @@ def run_iron_condor_strategy_for_day(
     exit_reason = None
     short_ce_stop_price = None
     short_pe_stop_price = None
+    trailing_sl_active = False
+    peak_mtm = 0.0
     records: list[dict] = []
 
     for i, bar in enumerate(bars):
@@ -163,28 +209,43 @@ def run_iron_condor_strategy_for_day(
                     in_position = True
                     entry_index = i
                     entry_bar = bar
+                    trailing_sl_active = False # Reset on new entry
+                    peak_mtm = 0.0
                     entry_flag, current_reason = True, "ENTRY"
-                    short_ce_stop_price = bar.short_ce_close * (1 + stop_loss_pct)
-                    short_pe_stop_price = bar.short_pe_close * (1 + stop_loss_pct)
+
                     log.info(
                         f"ENTRY at {bar.ts}: Net Credit={bar.net_credit_close:.2f} | "
-                        f"Short CE={bar.short_ce_close:.2f} (SL={short_ce_stop_price:.2f}), "
-                        f"Short PE={bar.short_pe_close:.2f} (SL={short_pe_stop_price:.2f}), "
+                        f"Short CE={bar.short_ce_close:.2f}), "
+                        f"Short PE={bar.short_pe_close:.2f}), "
                         f"Long CE={bar.long_ce_close:.2f}, Long PE={bar.long_pe_close:.2f}"
                     )
             
             if in_position:
                 current_net_credit = bar.net_credit_close
                 entry_net_credit = entry_bar.net_credit_close
-                total_pnl = (entry_net_credit - current_net_credit) * LOT_SIZE
+                total_pnl = (entry_net_credit - current_net_credit) * lot_size
                 
                 temp_exit_reason = None
                 if total_pnl >= take_profit_points:
                     temp_exit_reason = "TAKE_PROFIT"
-                elif bar.short_ce_close >= short_ce_stop_price or bar.short_pe_close >= short_pe_stop_price:
-                    temp_exit_reason = "STOP_LOSS_PCT"
                 elif total_pnl <= -absolute_stop_loss:
                     temp_exit_reason = "STOP_LOSS_ABS"
+                
+                # Trailing Stop Loss on Profit
+                if not trailing_sl_active and total_pnl >= trailing_activation_mtm:
+                    trailing_sl_active = True
+                    peak_mtm = total_pnl
+                    log.info(f"Trailing SL activated at PNL: {total_pnl:.2f}")
+                
+                if trailing_sl_active:
+                    new_peak_mtm = max(peak_mtm, total_pnl)
+                    if new_peak_mtm > peak_mtm:
+                        log.info(f"Peak MTM updated to: {new_peak_mtm:.2f}")
+                        peak_mtm = new_peak_mtm
+
+                    trailing_stop_level = peak_mtm * trailing_sl_reversal_pct
+                    if total_pnl <= trailing_stop_level:
+                        temp_exit_reason = "TRAILING_STOP_LOSS"
 
                 if temp_exit_reason:
                     in_position = False
@@ -210,11 +271,11 @@ def run_iron_condor_strategy_for_day(
         log.info(f"EXIT (EOD) at {last_bar.ts}: Net Credit={last_bar.net_credit_close:.2f}")
 
     if entry_index is not None:
-        pnl_per_lot = (entry_bar.net_credit_close - exit_bar.net_credit_close) * LOT_SIZE
+        pnl_per_lot = (entry_bar.net_credit_close - exit_bar.net_credit_close) * lot_size
         print(f"\n--- Day Summary ---\nDate: {trading_date}, PNL: {pnl_per_lot:.2f}, Reason: {exit_reason}")
 
     if export_csv:
-        out_dir = Path("data/processed/iron_condor")
+        out_dir = Path(f"data/processed/iron_condor/{index_name.lower()}")
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"iron_condor_backtest_{trading_date}.csv"
         
@@ -265,15 +326,15 @@ def _fetch_intraday_bars_for_ce_pe(
         bar_interval: str = "FIVE_MINUTE",
         expiry_str: str | None = None,
 ) -> tuple[list[StrangleBar], str, str]:
-    first15_close = get_nifty_first_15m_close(trading_date)
-    strikes_info = get_single_ce_pe_strikes(first15_close)
+    spot, _ = get_index_first_15m_close("NIFTY", trading_date)
+    strikes_info = get_single_ce_pe_strikes(spot, _, index_name="NIFTY")
     ce_strike, pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
 
-    log.info(f"Backtest date={trading_date}, first15_close={first15_close}")
+    log.info(f"Backtest date={trading_date}")
     log.info(f"CE strike={ce_strike} | PE strike={pe_strike}")
 
-    ce_contract = find_nifty_option(ce_strike, "CE", expiry_str=expiry_str, trading_date=trading_date)
-    pe_contract = find_nifty_option(pe_strike, "PE", expiry_str=expiry_str, trading_date=trading_date)
+    ce_contract = find_option("NIFTY", ce_strike, "CE", expiry_str=expiry_str, trading_date=trading_date)
+    pe_contract = find_option("NIFTY", pe_strike, "PE", expiry_str=expiry_str, trading_date=trading_date)
 
     api = AngelAPI()
     api.login()
@@ -303,7 +364,7 @@ def _fetch_intraday_bars_for_ce_pe(
 
 def run_vwap_strangle_strategy_for_day(
         trading_date: date,
-        bar_interval: str = "ONE_MINUTE",
+        index_name: str = "NIFTY", bar_interval: str = "ONE_MINUTE",
         expiry_str: str | None = None,
         stop_loss_pct: float = 0.70,
         absolute_stop_loss: float = 2000.0,
@@ -351,13 +412,11 @@ def run_vwap_strangle_strategy_for_day(
             
             if in_position:
                 ce_p, pe_p = bar.ce_close, bar.pe_close
-                total_pnl = ((entry_ce - ce_p) + (entry_pe - pe_p)) * LOT_SIZE
+                total_pnl = ((entry_ce - ce_p) + (entry_pe - pe_p)) * 75 # Assuming NIFTY lot size for now
                 
                 temp_exit_reason = None
                 if total_pnl >= take_profit_points:
                     temp_exit_reason = "TAKE_PROFIT"
-                elif ce_p >= ce_stop or pe_p >= pe_stop:
-                    temp_exit_reason = "STOP_LOSS_PCT"
                 elif total_pnl <= -absolute_stop_loss:
                     temp_exit_reason = "STOP_LOSS_ABS"
 
@@ -384,7 +443,7 @@ def run_vwap_strangle_strategy_for_day(
         log.info("No entry signal for the day (VWAP pattern never met).")
 
     if entry_index is not None:
-        pnl_per_lot = ((entry_ce - exit_ce) + (entry_pe - exit_pe)) * LOT_SIZE
+        pnl_per_lot = ((entry_ce - exit_ce) + (entry_pe - exit_pe)) * 75 # Assuming NIFTY lot size for now
         print(f"\n--- Day Summary ---\nDate: {trading_date}, PNL: {pnl_per_lot:.2f}, Reason: {exit_reason}")
 
     if export_csv:

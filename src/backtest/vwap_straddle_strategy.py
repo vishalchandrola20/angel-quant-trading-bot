@@ -7,9 +7,9 @@ from pathlib import Path
 import logging
 
 from src.api.smartapi_client import AngelAPI
-from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
+from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
 from src.strategy.strike_selection import get_atm_strike_custom
-from src.market.contracts import find_nifty_option
+from src.market.contracts import find_option
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -59,7 +59,7 @@ def _fetch_intraday_bars_for_atm_straddle(
     """
     Resolve ATM strike, then fetch CE/PE intraday candles for that ATM strike
     """
-    first15_close = get_nifty_first_15m_close(trading_date)
+    first15_close, _ = get_index_first_15m_close("NIFTY", trading_date)
     atm = get_atm_strike_custom(first15_close)
 
     ce_strike = atm
@@ -68,8 +68,8 @@ def _fetch_intraday_bars_for_atm_straddle(
     log.info("Backtest date=%s first15_close=%s ATM=%s", trading_date, first15_close, atm)
 
     # resolve option contracts (CE and PE at same strike)
-    ce_contract = find_nifty_option(ce_strike, "CE", expiry_str=expiry_str, trading_date=trading_date)
-    pe_contract = find_nifty_option(pe_strike, "PE", expiry_str=expiry_str, trading_date=trading_date)
+    ce_contract = find_option("NIFTY", ce_strike, "CE", expiry_str=expiry_str, trading_date=trading_date)
+    pe_contract = find_option("NIFTY", pe_strike, "PE", expiry_str=expiry_str, trading_date=trading_date)
 
     api = AngelAPI()
     api.login()

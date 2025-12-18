@@ -1,8 +1,6 @@
 # src/data_pipeline/nifty_first_15m.py
-import time
-from datetime import datetime, date, time as dt_time
+from datetime import datetime, date, time as dt_time, timedelta
 import logging
-from threading import Thread
 import time as time_module
 
 from src.api.smartapi_client import AngelAPI
@@ -10,35 +8,49 @@ from src.api.smartapi_client import AngelAPI
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-NIFTY_TOKEN = "99926000"
-NIFTY_EXCHANGE = "NSE"
+INDEX_CONFIG = {
+    "NIFTY": {
+        "token": "99926000",
+        "exchange": "NSE",
+    },
+    "SENSEX": {
+        "token": "99919000",
+        "exchange": "BSE",
+    }
+}
 
 
-def get_nifty_first_15m_close(trading_date: date | None = None) -> float:
+def get_index_first_15m_close(index_name: str, trading_date: date | None = None) -> tuple[float, datetime]:
     """
-    Returns the first 15-minute candle close of NIFTY for the given trading_date.
-    If trading_date is None, uses today's date.
-    Waits until 9:30 AM if started early.
+    Returns the close price and end time of the latest completed 15-minute candle.
+    - If trading_date is None, uses today's date.
+    - Waits until 9:30 AM if started early.
     """
-    if trading_date is None:
-        trading_date = datetime.now().date()
+    index_name = index_name.upper()
+    if index_name not in INDEX_CONFIG:
+        raise ValueError(f"Unsupported index: {index_name}. Supported are {list(INDEX_CONFIG.keys())}")
 
-    market_open_dt = datetime.combine(trading_date, dt_time(9, 30))
+    trading_date = trading_date or date.today()
     now = datetime.now()
 
-    if now < market_open_dt:
-        wait_seconds = (market_open_dt - now).total_seconds()
-        log.info(f"Current time is before 9:30 AM. Waiting for {wait_seconds:.0f} seconds...")
+    # Always target the first 15-minute candle of the day (9:15 - 9:30)
+    first_candle_end_time = datetime.combine(trading_date, dt_time(9, 30))
+
+    # If running before the first candle is complete, wait.
+    if now < first_candle_end_time:
+        wait_seconds = (first_candle_end_time - now).total_seconds()
+        log.info(f"Current time is before {first_candle_end_time.strftime('%H:%M')}. Waiting for {wait_seconds:.0f} seconds...")
         time_module.sleep(wait_seconds)
 
-    # 09:15 → 09:30 window for first 15m candle
+    # Set the time window to always be the first 15-minute candle
     start_dt = datetime.combine(trading_date, dt_time(9, 15))
     end_dt = datetime.combine(trading_date, dt_time(9, 30))
+    start_dt = end_dt - timedelta(minutes=15)
 
     from_str = start_dt.strftime("%Y-%m-%d %H:%M")
     to_str = end_dt.strftime("%Y-%m-%d %H:%M")
 
-    log.info(f"Fetching NIFTY first 15m candle for {trading_date} ({from_str} → {to_str})")
+    log.info(f"Fetching {index_name} 15m candle for {trading_date} ({from_str} → {to_str})")
 
     api = AngelAPI()
     api.login()
@@ -46,9 +58,10 @@ def get_nifty_first_15m_close(trading_date: date | None = None) -> float:
     if api.mock:
         raise RuntimeError("AngelAPI is in MOCK mode; cannot fetch real NIFTY candles.")
 
+    config = INDEX_CONFIG[index_name]
     params = {
-        "exchange": NIFTY_EXCHANGE,
-        "symboltoken": NIFTY_TOKEN,
+        "exchange": config["exchange"],
+        "symboltoken": config["token"],
         "interval": "FIFTEEN_MINUTE",
         "fromdate": from_str,
         "todate": to_str,
@@ -57,9 +70,9 @@ def get_nifty_first_15m_close(trading_date: date | None = None) -> float:
     res = api.connection.getCandleData(params)
     candles = res.get("data") or []
     if not candles:
-        raise RuntimeError(f"No candle data returned for NIFTY in range {from_str} → {to_str}")
+        raise RuntimeError(f"No candle data returned for {index_name} in range {from_str} → {to_str}")
 
     first = candles[0]
     ts, o, h, l, c, vol = first
-    log.info(f"First 15m candle for {trading_date}: O={o}, H={h}, L={l}, C={c}, V={vol}")
-    return float(c)
+    log.info(f"Latest 15m candle for {index_name} on {trading_date} ({from_str} -> {to_str}): O={o}, H={h}, L={l}, C={c}, V={vol}")
+    return float(c), end_dt

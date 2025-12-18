@@ -17,8 +17,8 @@ from collections import defaultdict
 from colorama import Fore, Style, init as colorama_init
 
 from src.api.smartapi_client import AngelAPI
-from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
-from src.market.contracts import find_nifty_option, OptionContract
+from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
+from src.market.contracts import find_option, OptionContract
 from src.strategy.strike_selection import get_single_ce_pe_strikes
 
 # Initialize colorama
@@ -47,31 +47,92 @@ except Exception as e:
 
 
 class IronCondorLive:
-    NIFTY_LOT_SIZE = 150
-    NIFTY_TOKEN = "99926000"
-    NIFTY_EXCHANGE = "NSE"
+    INDEX_CONFIG = {
+        "NIFTY": {
+            "lot_size": 150,
+            "token": "99926000",
+            "exchange": "NSE",
+            "options_exchange": "NFO",
+            "exchange_type": 1,
+            "options_exchange_type": 2,
+            "strike_step": 50,
+            "spot_proximity_exit_points": 40,
+            "take_profit_per_lot": 20.0,
+            "absolute_stop_loss_per_lot": 20.0,
+            "trailing_activation_mtm_per_lot": 8.0, # 1000 / 50 lots
+            "trailing_sl_reversal_pct": 0.70,
+        },
 
+        "SENSEX": {
+            "lot_size": 60,
+            "token": "99919000",
+            "exchange": "BSE",
+            "options_exchange": "BFO",
+            "exchange_type": 3,
+            "options_exchange_type": 4,
+            "strike_step": 100,
+            "spot_proximity_exit_points": 60,
+            "take_profit_per_lot": 50.0,
+            "absolute_stop_loss_per_lot": 50.0,
+            "trailing_activation_mtm_per_lot": 20, # 1000 / 60 lots
+            "trailing_sl_reversal_pct": 0.70,
+        }
+    }
 
     def __init__(
             self,
+            index_name: str = "NIFTY",
             trading_date: date | None = None,
             expiry: str | None = None,
-            take_profit_per_lot: float = 15.0,
-            absolute_stop_loss_per_lot: float = 25.0,
             vwap_recalc_interval_minutes: int = 5,
             simulate_orders: bool = True,
     ):
+        self.index_name = index_name.upper()
+        if self.index_name not in self.INDEX_CONFIG:
+            raise ValueError(f"Invalid index '{self.index_name}'. Must be one of {list(self.INDEX_CONFIG.keys())}")
+
+        config = self.INDEX_CONFIG[self.index_name]
+        self.lot_size = config["lot_size"]
+        self.index_token = config["token"]
+        self.index_exchange = config["exchange"]
+        self.options_exchange = config["options_exchange"]
+        self.exchange_type = config["exchange_type"]
+        self.options_exchange_type = config["options_exchange_type"]
+        self.strike_step = config["strike_step"]
+        self.spot_proximity_exit_points = config["spot_proximity_exit_points"]
+        take_profit_per_lot = config["take_profit_per_lot"]
+        absolute_stop_loss_per_lot = config["absolute_stop_loss_per_lot"]
+        trailing_activation_mtm_per_lot = config["trailing_activation_mtm_per_lot"]
+        self.trailing_sl_reversal_pct = config["trailing_sl_reversal_pct"]
+        self.trailing_activation_mtm = trailing_activation_mtm_per_lot * self.lot_size
+
+
         self.trading_date = trading_date or date.today()
         self.expiry = expiry
         self.simulate_orders = simulate_orders
         self.vwap_recalc_interval = timedelta(minutes=vwap_recalc_interval_minutes)
         
-        self.take_profit_points = take_profit_per_lot * self.NIFTY_LOT_SIZE
-        self.absolute_stop_loss = absolute_stop_loss_per_lot * self.NIFTY_LOT_SIZE
+        self.take_profit_points = take_profit_per_lot * self.lot_size
+        self.absolute_stop_loss = absolute_stop_loss_per_lot * self.lot_size
 
         self.api = AngelAPI()
         self.api.login()
         time_module.sleep(1)
+
+        self.short_ce_contract: OptionContract | None = None
+        self.short_pe_contract: OptionContract | None = None
+        self.long_ce_contract: OptionContract | None = None
+        self.long_pe_contract: OptionContract | None = None
+
+        self.latest_ltp: Dict[str, float] = {}
+        self.individual_leg_vwap_accumulators: Dict[str, Dict[str, float]] = {}
+        self.next_vwap_update_time: dt_time | None = None
+        self.in_position = False
+        self.trading_active = True
+        self.trailing_sl_active = False
+        self.peak_mtm = 0.0
+        self.entry_info: Dict[str, Any] = {}
+        self.exit_info: Dict[str, Any] = {}
 
         self.ws = None
 
@@ -95,12 +156,6 @@ class IronCondorLive:
 
     def _reset_state(self):
         """Resets all strategy state variables."""
-        self.short_ce_contract: OptionContract | None = None
-        self.short_pe_contract: OptionContract | None = None
-        self.long_ce_contract: OptionContract | None = None
-        self.long_pe_contract: OptionContract | None = None
-
-        self.latest_ltp: Dict[str, float] = {}
         self.individual_leg_vwap_accumulators: Dict[str, Dict[str, float]] = {
             "s_ce": {"cum_pv": 0.0, "cum_vol": 0.0},
             "s_pe": {"cum_pv": 0.0, "cum_vol": 0.0},
@@ -108,11 +163,10 @@ class IronCondorLive:
             "l_pe": {"cum_pv": 0.0, "cum_vol": 0.0},
         }
 
-        self.next_vwap_update_time: dt_time | None = None
         self.in_position = False
         self.trading_active = True # Flag to control the main trading loop
-        self.entry_info: Dict[str, Any] = {}
-        self.exit_info: Dict[str, Any] = {}
+        self.trailing_sl_active = False
+        self.peak_mtm = 0.0
 
         self.events_dir = Path("data/live")
         self.events_dir.mkdir(parents=True, exist_ok=True)
@@ -153,17 +207,15 @@ class IronCondorLive:
             return []
 
     def prepare_contracts(self):
-        first15 = get_nifty_first_15m_close(self.trading_date)
-        strikes_info = get_single_ce_pe_strikes(first15, trading_date=self.trading_date)
-        
-        short_ce_strike, short_pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
-        long_ce_strike = short_ce_strike + 8 * 50
-        long_pe_strike = short_pe_strike - 8 * 50
+        spot, spot_candle_end_time = get_index_first_15m_close(self.index_name, self.trading_date)
+        strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, self.index_name, trading_date=self.trading_date, strike_step=self.strike_step)
+        short_ce_strike, short_pe_strike, long_ce_strike, long_pe_strike = \
+            strikes_info["ce_strike"], strikes_info["pe_strike"], strikes_info["long_ce_strike"], strikes_info["long_pe_strike"]
 
-        self.short_ce_contract = find_nifty_option(short_ce_strike, "CE", self.expiry, self.trading_date)
-        self.short_pe_contract = find_nifty_option(short_pe_strike, "PE", self.expiry, self.trading_date)
-        self.long_ce_contract = find_nifty_option(long_ce_strike, "CE", self.expiry, self.trading_date)
-        self.long_pe_contract = find_nifty_option(long_pe_strike, "PE", self.expiry, self.trading_date)
+        self.short_ce_contract = find_option(self.index_name, short_ce_strike, "CE", self.expiry, self.trading_date)
+        self.short_pe_contract = find_option(self.index_name, short_pe_strike, "PE", self.expiry, self.trading_date)
+        self.long_ce_contract = find_option(self.index_name, long_ce_strike, "CE", self.expiry, self.trading_date)
+        self.long_pe_contract = find_option(self.index_name, long_pe_strike, "PE", self.expiry, self.trading_date)
         
         # Initial VWAP calculation will be triggered on the first tick after 9:30
         log.info("Contracts prepared. VWAP will be calculated on the first tick after 9:30 AM.")
@@ -250,6 +302,8 @@ class IronCondorLive:
             }
             self.short_ce_stop = self.entry_info["short_ce_entry"] * 2.20
             self.short_pe_stop = self.entry_info["short_pe_entry"] * 2.20
+            self.trailing_sl_active = False # Reset for new position
+            self.peak_mtm = 0.0
             log.info(f"Resumed with entry prices and SLs.")
         else:
             log.info("No complete Iron Condor position found to resume.")
@@ -295,7 +349,7 @@ class IronCondorLive:
             # Angel sends prices as integers (e.g. 123.45 is sent as 12345)
             # Exchange Type: 1=NSE_IDX, 2=NFO_OPT
             exchange_type = payload.get("exchange_type")
-            if exchange_type in [1, 2]:
+            if exchange_type in [1, 2, 3, 4]: # Handle NIFTY and SENSEX
                 ltp /= 100.0
             vol = float(payload.get("volume_trade_for_the_day") or payload.get("volume") or payload.get("v") or 0)
         except (TypeError, ValueError): return
@@ -332,21 +386,25 @@ class IronCondorLive:
             sim_sp_entry = self.latest_ltp.get(self.short_pe_contract.token, 0.0)
             sim_lc_entry = self.latest_ltp.get(self.long_ce_contract.token, 0.0)
             sim_lp_entry = self.latest_ltp.get(self.long_pe_contract.token, 0.0)
-            sim_nifty_entry = self.latest_ltp.get(self.NIFTY_TOKEN, 0.0)
+            sim_index_entry = self.latest_ltp.get(self.index_token, 0.0)
+            log.info(
+                f"event=ORDER_ENTRY_INIT | Triggered at NetCredit={current_net_credit:.2f}, VWAP={current_vwap:.2f} | "
+                f"Prices: S_CE={sim_sc_entry:.2f}, S_PE={sim_sp_entry:.2f}, L_CE={sim_lc_entry:.2f}, L_PE={sim_lp_entry:.2f}"
+            )
 
             self.in_position = True
             self.entry_info = {
                 "ts": datetime.now().isoformat(),
                 "short_ce_entry": sim_sc_entry, "short_pe_entry": sim_sp_entry,
                 "long_ce_entry": sim_lc_entry, "long_pe_entry": sim_lp_entry,
-                "nifty_entry_price": sim_nifty_entry,
+                "nifty_entry_price": sim_index_entry,
             }
-            log.info(f"{Fore.GREEN}SIMULATION: ENTRY CONFIRMED | Iron Condor position entered at NIFTY {sim_nifty_entry:.2f}.")
+            log.info(f"{Fore.GREEN}SIMULATION: ENTRY CONFIRMED | Iron Condor position entered at {self.index_name} {sim_index_entry:.2f}.")
             return
         
         try:
-            lc_id = self.api.place_order(self.long_ce_contract.symbol, self.long_ce_contract.token, self.NIFTY_LOT_SIZE, "BUY")
-            lp_id = self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.NIFTY_LOT_SIZE, "BUY")
+            lc_id = self.api.place_order(self.long_ce_contract.symbol, self.long_ce_contract.token, self.lot_size, "BUY")
+            lp_id = self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.lot_size, "BUY")
         except Exception as e:
             log.error(f"Failed to place one or both BUY orders: {e}"); return
 
@@ -357,8 +415,8 @@ class IronCondorLive:
             log.error("One or both BUY orders failed to confirm. Aborting entry."); return
 
         try:
-            sc_id = self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.NIFTY_LOT_SIZE, "SELL")
-            sp_id = self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.NIFTY_LOT_SIZE, "SELL")
+            sc_id = self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.lot_size, "SELL")
+            sp_id = self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.lot_size, "SELL")
         except Exception as e:
             log.error(f"Failed to place one or both SELL orders: {e}. Exiting bought legs.")
             self._execute_exit(exit_reason="SELL_LEG_FAILED"); return
@@ -370,18 +428,20 @@ class IronCondorLive:
             log.error("One or both SELL orders failed. Exiting all legs.")
             self._execute_exit(exit_reason="PARTIAL_SELL_FAILED"); return
 
-        nifty_entry_price = self.api.get_ltp(self.NIFTY_EXCHANGE, "NIFTY", self.NIFTY_TOKEN)
+        index_entry_price = self.api.get_ltp(self.index_exchange, self.index_name, self.index_token)
 
         self.in_position = True
         self.entry_info = {
             "ts": datetime.now().isoformat(),
             "short_ce_entry": float(sc_details['averageprice']), "short_pe_entry": float(sp_details['averageprice']),
             "long_ce_entry": float(lc_details['averageprice']), "long_pe_entry": float(lp_details['averageprice']),
-            "nifty_entry_price": nifty_entry_price,
+            "nifty_entry_price": index_entry_price,
         }
         self.short_ce_stop = self.entry_info["short_ce_entry"] * 1.70
         self.short_pe_stop = self.entry_info["short_pe_entry"] * 1.70
-        log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | Iron Condor position entered at NIFTY {nifty_entry_price}.")
+        log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | Iron Condor position entered at {self.index_name} {index_entry_price}.")
+        self.trailing_sl_active = False # Reset for new position
+        self.peak_mtm = 0.0
 
     def _execute_exit(self, exit_reason="STRATEGY_EXIT"):
         log.info(f"event=ORDER_EXIT_INIT | Triggered by: {exit_reason}")
@@ -393,7 +453,7 @@ class IronCondorLive:
                                    (self.entry_info['long_ce_entry'] + self.entry_info['long_pe_entry'])
                 current_net_credit = (self.latest_ltp.get(self.short_ce_contract.token, 0) + self.latest_ltp.get(self.short_pe_contract.token, 0)) - \
                                      (self.latest_ltp.get(self.long_ce_contract.token, 0) + self.latest_ltp.get(self.long_pe_contract.token, 0))
-                simulated_open_pnl = (entry_net_credit - current_net_credit) * self.NIFTY_LOT_SIZE
+                simulated_open_pnl = (entry_net_credit - current_net_credit) * self.lot_size
                 self.closed_pnl += simulated_open_pnl
             self.in_position = False
             self.trading_active = False # Stop trading for the day
@@ -402,10 +462,10 @@ class IronCondorLive:
             return
 
         # --- Real Order Placement ---
-        self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.NIFTY_LOT_SIZE, "BUY")
-        self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.NIFTY_LOT_SIZE, "BUY")
-        self.api.place_order(self.long_ce_contract.symbol, self.long_ce_contract.token, self.NIFTY_LOT_SIZE, "SELL")
-        self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.NIFTY_LOT_SIZE, "SELL")
+        self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.lot_size, "BUY")
+        self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.lot_size, "BUY")
+        self.api.place_order(self.long_ce_contract.symbol, self.long_ce_contract.token, self.lot_size, "SELL")
+        self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.lot_size, "SELL")
         
         self.in_position = False
         self.trading_active = False # Stop trading for the day
@@ -424,7 +484,6 @@ class IronCondorLive:
 
         current_time = now.time()
         if current_time < dt_time(9, 30): return
-
         # --- Periodic VWAP Recalculation ---
         if self.next_vwap_update_time is None or current_time >= self.next_vwap_update_time:
             self._recalculate_vwap_from_history(now)
@@ -435,7 +494,7 @@ class IronCondorLive:
         s_pe_ltp = self.latest_ltp.get(self.short_pe_contract.token)
         l_ce_ltp = self.latest_ltp.get(self.long_ce_contract.token)
         l_pe_ltp = self.latest_ltp.get(self.long_pe_contract.token)
-        nifty_ltp = self.latest_ltp.get(self.NIFTY_TOKEN)
+        nifty_ltp = self.latest_ltp.get(self.index_token)
 
         if not all([s_ce_ltp, s_pe_ltp, l_ce_ltp, l_pe_ltp, nifty_ltp]): return
 
@@ -443,6 +502,7 @@ class IronCondorLive:
         vwap = self._get_strategy_vwap()
 
         if not self.in_position:
+            log.info(f"reached here to take entry {self.in_position}")
             # Simplified Entry: Enter on the first valid tick after 9:30 AM if not already in a position.
             self._execute_entry(net_credit, vwap)
         else:
@@ -450,12 +510,12 @@ class IronCondorLive:
             entry_net_credit = (self.entry_info['short_ce_entry'] + self.entry_info['short_pe_entry']) - \
                                (self.entry_info['long_ce_entry'] + self.entry_info['long_pe_entry'])
             
-            open_pnl = (entry_net_credit - net_credit) * self.NIFTY_LOT_SIZE
+            open_pnl = (entry_net_credit - net_credit) * self.lot_size
             total_pnl = open_pnl + self.closed_pnl
             
             nifty_change = nifty_ltp - self.entry_info.get("nifty_entry_price", nifty_ltp)
             nifty_color = Fore.GREEN if nifty_change >= 0 else Fore.RED
-            nifty_str = f"NIFTY: {nifty_ltp:.2f} ({nifty_color}{nifty_change:+.2f}{Style.RESET_ALL})"
+            nifty_str = f"{self.index_name}: {nifty_ltp:.2f} ({nifty_color}{nifty_change:+.2f}{Style.RESET_ALL})"
 
             pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
             log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f}, VWAP={vwap:.2f} | Open PNL: {open_pnl:+.2f}, Closed PNL: {self.closed_pnl:+.2f}, Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
@@ -464,8 +524,27 @@ class IronCondorLive:
                 self._execute_exit(exit_reason="TAKE_PROFIT")
             elif total_pnl <= -self.absolute_stop_loss:
                 self._execute_exit(exit_reason="STOP_LOSS_ABS")
-            elif s_ce_ltp >= self.entry_info.get("short_ce_entry", 0) * 2.2 or s_pe_ltp >= self.entry_info.get("short_pe_entry", 0) * 2.2:
-                self._execute_exit(exit_reason="STOP_LOSS_PCT")
+            # New condition: Spot price near short strikes
+            elif nifty_ltp <= (self.short_pe_contract.strike + self.spot_proximity_exit_points) or \
+                nifty_ltp >= (self.short_ce_contract.strike - self.spot_proximity_exit_points):
+                self._execute_exit(exit_reason="SPOT_NEAR_STRIKE")
+            
+            # Trailing Stop Loss on Profit
+            if not self.trailing_sl_active and total_pnl >= self.trailing_activation_mtm:
+                self.trailing_sl_active = True
+                self.peak_mtm = total_pnl
+                log.info(f"{Fore.MAGENTA}Trailing SL activated at PNL: {total_pnl:.2f}{Style.RESET_ALL}")
+            
+            if self.trailing_sl_active:
+                new_peak_mtm = max(self.peak_mtm, total_pnl)
+                if new_peak_mtm > self.peak_mtm:
+                    log.info(f"Peak MTM updated to: {new_peak_mtm:.2f}")
+                    self.peak_mtm = new_peak_mtm
+
+                trailing_stop_level = self.peak_mtm * self.trailing_sl_reversal_pct
+                if total_pnl <= trailing_stop_level:
+                    log.info(f"{Fore.MAGENTA}Trailing SL triggered. Current PNL {total_pnl:.2f} <= 70% of Peak PNL {self.peak_mtm:.2f}{Style.RESET_ALL}")
+                    self._execute_exit(exit_reason="TRAILING_STOP_LOSS")
 
     def run(self):
         self.prepare_contracts()
@@ -478,10 +557,10 @@ class IronCondorLive:
 
         try:
             self.ws = SmartWebSocketV2(self.api.jwt_token, self.api.api_key, self.api.client_id, self.api.feed_token)
-            token_list = [{"exchangeType": 2, "tokens": [
+            token_list = [{"exchangeType": self.options_exchange_type, "tokens": [
                 self.short_ce_contract.token, self.short_pe_contract.token,
                 self.long_ce_contract.token, self.long_pe_contract.token
-            ]}, {"exchangeType": 1, "tokens": [self.NIFTY_TOKEN]}]
+            ]}, {"exchangeType": self.exchange_type, "tokens": [self.index_token]}]
             
             def on_open(wsapp):
                 log.info("event=WS_OPEN | Subscribing to tokens: %s", token_list)
@@ -499,6 +578,7 @@ class IronCondorLive:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--index", default="NIFTY", help="Index to trade: NIFTY or SENSEX (default: NIFTY)")
     parser.add_argument("--expiry", help="Optional expiry string like 27NOV2025")
     parser.add_argument("--date", help="Trading date YYYY-MM-DD (default: today)")
     parser.add_argument("--vwap-interval", type=int, default=5, help="Interval in minutes to recalculate VWAP (default: 5)")
@@ -507,7 +587,7 @@ def main():
     args = parser.parse_args()
 
     trading_date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
-    s = IronCondorLive(trading_date=trading_date, expiry=args.expiry,
+    s = IronCondorLive(index_name=args.index, trading_date=trading_date, expiry=args.expiry,
                        vwap_recalc_interval_minutes=args.vwap_interval, simulate_orders=args.simulate_orders)
     s.run()
 

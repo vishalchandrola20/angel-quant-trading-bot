@@ -10,8 +10,6 @@ import yaml
 import pyotp
 import logging
 import uuid
-import json
-import requests
 
 try:
     from SmartApi import SmartConnect
@@ -84,16 +82,20 @@ class AngelAPI:
         transaction_type: str,
         order_type: str = "MARKET",
         product_type: str = "INTRADAY",
-        exchange: str = "NFO",
     ) -> str:
         """
         Places an order and returns the order ID.
-        Raises a RuntimeError if the order placement fails.
+        Automatically determines the exchange based on the tradingsymbol.
         """
         if self.mock:
             order_id = str(uuid.uuid4())
             log.info(f"MOCK order placed for {tradingsymbol}. MOCK order ID: {order_id}")
             return order_id
+
+        if "SENSEX" in tradingsymbol:
+            exchange = "BFO"
+        else:
+            exchange = "NFO"
 
         order_params = {
             "variety": "NORMAL",
@@ -110,7 +112,7 @@ class AngelAPI:
         order_id = self.connection.placeOrder(order_params)
         
         if order_id:
-            log.info(f"Successfully placed order for {tradingsymbol}. Order ID: {order_id}")
+            log.info(f"Successfully placed order for {tradingsymbol} on {exchange}. Order ID: {order_id}")
             return order_id
         else:
             raise RuntimeError(f"Order placement failed for {tradingsymbol}. No order ID returned.")
@@ -198,7 +200,7 @@ class AngelAPI:
             return None
         try:
             payload = {"name": name, "expirydate": expiry_date}
-            response = self.connection._postRequest("api.optionGreek", payload)
+            response = self.connection._postRequest("api.market.optiongreeks", payload)
             return response
         except Exception as e:
             log.exception(f"Exception while fetching option greeks: {e}")
