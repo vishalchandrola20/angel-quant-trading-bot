@@ -80,10 +80,26 @@ class Bar:
 
     @property
     def net_credit_high(self) -> float:
-        return (self.short_ce_high + self.short_pe_high) - (self.long_ce_low + self.long_pe_low)
+        # Represents the highest possible net credit (max potential loss) in a realistic scenario.
+        # We consider two possibilities: a sharp move up or a sharp move down.
+
+        # Scenario 1: Market moves UP, testing the call side.
+        # Short CE is at its high, Short PE is at its low.
+        # Long CE is at its high, Long PE is at its low.
+        high_credit_on_up_move = (self.short_ce_high + self.short_pe_low) - (self.long_ce_high + self.long_pe_low)
+
+        # Scenario 2: Market moves DOWN, testing the put side.
+        # Short PE is at its high, Short CE is at its low.
+        # Long PE is at its high, Long CE is at its low.
+        high_credit_on_down_move = (self.short_ce_low + self.short_pe_high) - (self.long_ce_low + self.long_pe_high)
+
+        # The true high is the worst (maximum) of these two realistic scenarios.
+        return max(high_credit_on_up_move, high_credit_on_down_move)
 
     @property
     def net_credit_low(self) -> float:
+        # Represents the lowest possible net credit (max potential profit) in the bar.
+        # This occurs when short options are at their low and long options are at their high.
         return (self.short_ce_low + self.short_pe_low) - (self.long_ce_high + self.long_pe_high)
 
     @property
@@ -183,8 +199,6 @@ def run_iron_condor_strategy_for_day(
     entry_bar = None
     exit_bar = None
     exit_reason = None
-    short_ce_stop_price = None
-    short_pe_stop_price = None
     trailing_sl_active = False
     peak_mtm = 0.0
     records: list[dict] = []
@@ -201,6 +215,7 @@ def run_iron_condor_strategy_for_day(
 
         entry_flag = exit_flag = False
         current_reason = ""
+        pnl = 0.0
 
         if bar_time >= time(9, 30):
             if not in_position and exit_index is None:
@@ -220,32 +235,46 @@ def run_iron_condor_strategy_for_day(
                         f"Long CE={bar.long_ce_close:.2f}, Long PE={bar.long_pe_close:.2f}"
                     )
             
-            if in_position:
-                current_net_credit = bar.net_credit_close
+            if in_position and bar_time >= time(9, 31):
                 entry_net_credit = entry_bar.net_credit_close
-                total_pnl = (entry_net_credit - current_net_credit) * lot_size
+
+                # Calculate PNL based on the high and low of the net credit to get a true picture of the bar's range
+                # Max profit in the bar occurs at the lowest credit value.
+                max_pnl_in_bar = (entry_net_credit - bar.net_credit_low) * lot_size
+                # Max loss in the bar occurs at the highest credit value.
+                min_pnl_in_bar = (entry_net_credit - bar.net_credit_high) * lot_size
+                log.info(f"bar.net_credit_high={bar.net_credit_high}")
+                log.info(f"entry_net_credit={entry_net_credit}")
+
+                # PNL at the close of the bar for final calculation if an exit is triggered.
+                pnl_at_close = (entry_net_credit - bar.net_credit_close) * lot_size
+                pnl = pnl_at_close
                 
                 temp_exit_reason = None
-                if total_pnl >= take_profit_points:
+                # Check exit conditions based on the bar's range
+                if max_pnl_in_bar >= take_profit_points:
                     temp_exit_reason = "TAKE_PROFIT"
-                elif total_pnl <= -absolute_stop_loss:
+                elif min_pnl_in_bar <= -absolute_stop_loss:
                     temp_exit_reason = "STOP_LOSS_ABS"
                 
                 # Trailing Stop Loss on Profit
-                if not trailing_sl_active and total_pnl >= trailing_activation_mtm:
+                if not trailing_sl_active and max_pnl_in_bar >= trailing_activation_mtm:
                     trailing_sl_active = True
-                    peak_mtm = total_pnl
-                    log.info(f"Trailing SL activated at PNL: {total_pnl:.2f}")
+                    peak_mtm = max_pnl_in_bar
+                    log.info(f"Trailing SL activated at PNL: {max_pnl_in_bar:.2f}")
                 
                 if trailing_sl_active:
-                    new_peak_mtm = max(peak_mtm, total_pnl)
+                    new_peak_mtm = max(peak_mtm, max_pnl_in_bar)
                     if new_peak_mtm > peak_mtm:
                         log.info(f"Peak MTM updated to: {new_peak_mtm:.2f}")
                         peak_mtm = new_peak_mtm
 
                     trailing_stop_level = peak_mtm * trailing_sl_reversal_pct
-                    if total_pnl <= trailing_stop_level:
+                    # If the bar's worst PNL (min_pnl_in_bar) breaches the trailing stop, exit.
+                    if min_pnl_in_bar <= trailing_stop_level:
+                        log.info(f"Trailing SL triggered at PNL: {min_pnl_in_bar:.2f}")
                         temp_exit_reason = "TRAILING_STOP_LOSS"
+                        pnl = peak_mtm*trailing_sl_reversal_pct
 
                 if temp_exit_reason:
                     in_position = False
@@ -253,16 +282,19 @@ def run_iron_condor_strategy_for_day(
                     exit_bar = bar
                     exit_reason, exit_flag, current_reason = temp_exit_reason, True, temp_exit_reason
                     log.info(
-                        f"EXIT ({exit_reason}) at {bar.ts}: PNL={total_pnl:.2f} | Net Credit={current_net_credit:.2f} | "
+                        f"EXIT ({exit_reason}) at {bar.ts}: PNL={pnl:.2f} | Net Credit={bar.net_credit_close:.2f} | "
                         f"Short CE={bar.short_ce_close:.2f}, Short PE={bar.short_pe_close:.2f}, "
                         f"Long CE={bar.long_ce_close:.2f}, Long PE={bar.long_pe_close:.2f}"
                     )
 
-        records.append({
-            "ts": bar.ts, "net_credit_close": bar.net_credit_close, "vwap": vwap,
-            "in_position": int(in_position), "entry_flag": int(entry_flag),
-            "exit_flag": int(exit_flag), "reason": current_reason,
-        })
+        records.append(
+            {
+                "ts": bar.ts, "pnl": pnl, "net_credit_close": bar.net_credit_close, "vwap": vwap,
+                "net_credit_high": bar.net_credit_high, "net_credit_low": bar.net_credit_low,
+                "in_position": int(in_position), "entry_flag": int(entry_flag),
+                "exit_flag": int(exit_flag), "reason": current_reason,
+            }
+        )
 
     if entry_index is not None and exit_index is None:
         last_bar = bars[-1]
@@ -272,6 +304,8 @@ def run_iron_condor_strategy_for_day(
 
     if entry_index is not None:
         pnl_per_lot = (entry_bar.net_credit_close - exit_bar.net_credit_close) * lot_size
+        if exit_reason == "TRAILING_STOP_LOSS":
+            pnl_per_lot = peak_mtm * 0.60
         print(f"\n--- Day Summary ---\nDate: {trading_date}, PNL: {pnl_per_lot:.2f}, Reason: {exit_reason}")
 
     if export_csv:
@@ -343,7 +377,7 @@ def _fetch_intraday_bars_for_ce_pe(
         raise RuntimeError("AngelAPI in MOCK mode; cannot backtest with real data.")
 
     start_dt = datetime.combine(trading_date, time(9, 15))
-    end_dt = datetime.combine(trading_date, time(15, 15))
+    end_dt = datetime.combine(trading_date, time(14, 50))
     from_str, to_str = start_dt.strftime("%Y-%m-%d %H:%M"), end_dt.strftime("%Y-%m-%d %H:%M")
 
     ce_res = api.connection.getCandleData({"exchange": ce_contract.exchange, "symboltoken": ce_contract.token, "interval": bar_interval, "fromdate": from_str, "todate": to_str})

@@ -106,7 +106,7 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             hedge_offset = 500
         elif days_to_expiry in [1, 2]:
             strike_offset = 600
-            hedge_offset = 600
+            hedge_offset = 800
         elif days_to_expiry == 3:
             strike_offset = 700
             hedge_offset = 700
@@ -115,7 +115,7 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             hedge_offset = 700
         log.info(f"SENSEX expiry is in {days_to_expiry} days. Selected strike offset: {strike_offset}, hedge offset: {hedge_offset}")
     else:  # Default to NIFTY
-        strike_offset = 150
+        strike_offset = 100
         hedge_offset = 400
 
     ce_strike = ce_base + strike_offset

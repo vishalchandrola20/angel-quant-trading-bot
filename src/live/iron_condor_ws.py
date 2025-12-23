@@ -74,7 +74,7 @@ class IronCondorLive:
             "spot_proximity_exit_points": 60,
             "take_profit_per_lot": 50.0,
             "absolute_stop_loss_per_lot": 50.0,
-            "trailing_activation_mtm_per_lot": 20, # 1000 / 60 lots
+            "trailing_activation_mtm_per_lot": 18, # 1000 / 60 lots
             "trailing_sl_reversal_pct": 0.70,
         }
     }
@@ -293,12 +293,21 @@ class IronCondorLive:
             log.warning("event=RESUME_POSITION | Found existing open Iron Condor. Resuming management.")
             self.in_position = True
             
+            # Fetch current index price to use as reference for PNL change display
+            try:
+                index_ltp = self.api.get_ltp(self.index_exchange, self.index_name, self.index_token)
+                self.latest_ltp[self.index_token] = index_ltp
+            except Exception as e:
+                log.error(f"Failed to fetch index LTP during resume: {e}")
+                index_ltp = 0.0
+
             self.entry_info = {
                 "ts": datetime.now().isoformat(),
                 "short_ce_entry": float(s_ce['sellavgprice']),
                 "short_pe_entry": float(s_pe['sellavgprice']),
                 "long_ce_entry": float(l_ce['buyavgprice']),
                 "long_pe_entry": float(l_pe['buyavgprice']),
+                "nifty_entry_price": index_ltp,
             }
             self.short_ce_stop = self.entry_info["short_ce_entry"] * 2.20
             self.short_pe_stop = self.entry_info["short_pe_entry"] * 2.20
@@ -387,6 +396,14 @@ class IronCondorLive:
             sim_lc_entry = self.latest_ltp.get(self.long_ce_contract.token, 0.0)
             sim_lp_entry = self.latest_ltp.get(self.long_pe_contract.token, 0.0)
             sim_index_entry = self.latest_ltp.get(self.index_token, 0.0)
+            
+            if sim_index_entry == 0.0:
+                try:
+                    sim_index_entry = self.api.get_ltp(self.index_exchange, self.index_name, self.index_token)
+                    self.latest_ltp[self.index_token] = sim_index_entry
+                except Exception:
+                    pass
+
             log.info(
                 f"event=ORDER_ENTRY_INIT | Triggered at NetCredit={current_net_credit:.2f}, VWAP={current_vwap:.2f} | "
                 f"Prices: S_CE={sim_sc_entry:.2f}, S_PE={sim_sp_entry:.2f}, L_CE={sim_lc_entry:.2f}, L_PE={sim_lp_entry:.2f}"
@@ -538,7 +555,7 @@ class IronCondorLive:
             if self.trailing_sl_active:
                 new_peak_mtm = max(self.peak_mtm, total_pnl)
                 if new_peak_mtm > self.peak_mtm:
-                    log.info(f"Peak MTM updated to: {new_peak_mtm:.2f}")
+                    log.info(f"{Fore.MAGENTA}Peak MTM updated to:: {new_peak_mtm:.2f}{Style.RESET_ALL}")
                     self.peak_mtm = new_peak_mtm
 
                 trailing_stop_level = self.peak_mtm * self.trailing_sl_reversal_pct

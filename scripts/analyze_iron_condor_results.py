@@ -48,28 +48,32 @@ def analyze_single_day(csv_path: Path) -> dict | None:
     exit_time = exit_row["ts"]
     exit_net_credit = float(exit_row["net_credit_close"])
 
-    # For a short credit spread, profit is entry credit - exit credit
-    total_pnl = entry_net_credit - exit_net_credit
+    # Use the final PNL value from the exit row in the CSV
+    total_pnl = exit_row["pnl"]
 
     # --- In-Trade P&L ---
     trade_slice = df.loc[entry_idx:exit_idx].copy()
-    trade_slice["pnl_bar"] = entry_net_credit - trade_slice["net_credit_close"]
+    # Max profit in a bar is when credit is lowest; Max loss is when credit is highest.
+    trade_slice["max_pnl_in_bar"] = (entry_net_credit - trade_slice["net_credit_low"])
+    trade_slice["min_pnl_in_bar"] = (entry_net_credit - trade_slice["net_credit_high"])
     
-    max_profit_trade_row = trade_slice.loc[trade_slice["pnl_bar"].idxmax()]
+    max_profit_trade_row = trade_slice.loc[trade_slice["max_pnl_in_bar"].idxmax()]
     max_profit_trade_time = max_profit_trade_row["ts"]
-    max_profit_trade = max_profit_trade_row["pnl_bar"]
-    max_loss_trade = trade_slice["pnl_bar"].min()
+    max_profit_trade = max_profit_trade_row["max_pnl_in_bar"]
+    max_loss_trade = trade_slice["min_pnl_in_bar"].min()
 
     # --- Full-Day P&L (relative to entry) ---
-    df["pnl_bar_day"] = entry_net_credit - df["net_credit_close"]
+    df_after_930 = df[df['ts'].dt.time >= pd.to_datetime('09:30').time()]
+    df_after_930["max_pnl_in_bar_day"] = (entry_net_credit - df_after_930["net_credit_low"])
+    df_after_930["min_pnl_in_bar_day"] = (entry_net_credit - df_after_930["net_credit_high"])
     
-    max_profit_day_row = df.loc[df["pnl_bar_day"].idxmax()]
+    max_profit_day_row = df_after_930.loc[df_after_930["max_pnl_in_bar_day"].idxmax()]
     max_profit_day_time = max_profit_day_row["ts"]
-    max_profit_day = max_profit_day_row["pnl_bar_day"]
+    max_profit_day = max_profit_day_row["max_pnl_in_bar_day"]
 
-    max_loss_day_row = df.loc[df["pnl_bar_day"].idxmin()]
+    max_loss_day_row = df_after_930.loc[df_after_930["min_pnl_in_bar_day"].idxmin()]
     max_loss_day_time = max_loss_day_row["ts"]
-    max_loss_day = max_loss_day_row["pnl_bar_day"]
+    max_loss_day = max_loss_day_row["min_pnl_in_bar_day"]
 
     first_hit = "PROFIT" if max_profit_day_time < max_loss_day_time else "LOSS"
 
