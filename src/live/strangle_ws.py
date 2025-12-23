@@ -152,6 +152,7 @@ class StrangleLive:
         if now > start_of_day:
             log.info("event=VWAP_INIT | Pre-filling VWAP from 9:15 AM to current time using OHLC/4.")
             ce_hist_bars = self._get_historical_candles(self.ce_contract, start_of_day, now)
+            time.sleep(1)
             pe_hist_bars = self._get_historical_candles(self.pe_contract, start_of_day, now)
 
             if ce_hist_bars and pe_hist_bars:
@@ -229,7 +230,7 @@ class StrangleLive:
             while buys and sells:
                 buy = buys.pop(0)
                 sell = sells.pop(0)
-                pnl += (float(sell['fillprice']) - float(buy['fillprice'])) * int(buy['fillquantity'])
+                pnl += (float(sell['fillprice']) - float(buy['fillprice'])) * int(buy['fillsize'])
         
         return pnl
 
@@ -278,7 +279,7 @@ class StrangleLive:
         pe_details = self._poll_order_status(pe_order_id)
 
         if not ce_details or not pe_details:
-            log.error("One or both entry orders failed. Exiting all legs.")
+            log.error("One or both entry orders failed. Exiting all legs."); 
             self._execute_exit(ce_only=bool(ce_details), pe_only=bool(pe_details), exit_reason="PARTIAL_ENTRY_FAILED"); return
 
         self.in_position = True

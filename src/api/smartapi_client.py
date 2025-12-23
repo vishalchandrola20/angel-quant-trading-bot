@@ -82,16 +82,20 @@ class AngelAPI:
         transaction_type: str,
         order_type: str = "MARKET",
         product_type: str = "INTRADAY",
-        exchange: str = "NFO",
     ) -> str:
         """
         Places an order and returns the order ID.
-        Raises a RuntimeError if the order placement fails.
+        Automatically determines the exchange based on the tradingsymbol.
         """
         if self.mock:
             order_id = str(uuid.uuid4())
             log.info(f"MOCK order placed for {tradingsymbol}. MOCK order ID: {order_id}")
             return order_id
+
+        if "SENSEX" in tradingsymbol:
+            exchange = "BFO"
+        else:
+            exchange = "NFO"
 
         order_params = {
             "variety": "NORMAL",
@@ -108,7 +112,7 @@ class AngelAPI:
         order_id = self.connection.placeOrder(order_params)
         
         if order_id:
-            log.info(f"Successfully placed order for {tradingsymbol}. Order ID: {order_id}")
+            log.info(f"Successfully placed order for {tradingsymbol} on {exchange}. Order ID: {order_id}")
             return order_id
         else:
             raise RuntimeError(f"Order placement failed for {tradingsymbol}. No order ID returned.")
@@ -158,7 +162,7 @@ class AngelAPI:
         
         try:
             response = self.connection.position()
-            log.info(f"Open positions response: {response}")
+
             if response and response.get("status"):
                 return response.get("data")
             else:
@@ -187,6 +191,21 @@ class AngelAPI:
             log.exception("Exception while fetching trade book.")
             return None
 
+    def get_option_greeks(self, name: str, expiry_date: str) -> dict | None:
+        """
+        Fetches option greeks using the library's _postRequest method.
+        """
+        if self.mock:
+            log.warning("MOCK mode, cannot fetch greeks.")
+            return None
+        try:
+            payload = {"name": name, "expirydate": expiry_date}
+            response = self.connection._postRequest("api.market.optiongreeks", payload)
+            return response
+        except Exception as e:
+            log.exception(f"Exception while fetching option greeks: {e}")
+            return None
+
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str | int) -> float:
         """
         Fetch LTP using SmartAPI ltpData for a single instrument.
@@ -211,16 +230,16 @@ if __name__ == "__main__":
     api.login()
     if not api.mock:
         try:
-            positions = api.get_open_positions()
-            print("Open Positions:", positions)
-            
-            order_book = api.get_order_book()
-            print("Order Book:", order_book)
-
-            trade_book = api.get_trade_book()
-            print("Trade Book:", trade_book)
+            # Example usage for greeks
+            greeks = api.get_option_greeks(name="NIFTY", expiry_date="18DEC2025")
+            if greeks:
+                print(f"Option Greeks for NIFTY 18DEC2025 (found {len(greeks.get('data', []))}):")
+                # Print greeks for a specific strike if found
+                for greek in greeks.get('data', []):
+                    if greek.get("strikePrice") == 26000:
+                        print(greek)
 
         except Exception as e:
             print(e)
     else:
-        print("Running in MOCK mode. Cannot place real orders.")
+        print("Running in MOCK mode.")

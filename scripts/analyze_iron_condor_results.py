@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -9,8 +8,7 @@ from colorama import Fore, Style, init as colorama_init
 # Initialize colorama
 colorama_init(autoreset=True)
 
-CONDOR_DIR = Path("data/processed/iron_condor")
-OUT_PATH = Path("data/processed/iron_condor_summary.csv")
+BASE_DIR = Path("data/processed/iron_condor")
 
 
 def analyze_single_day(csv_path: Path) -> dict | None:
@@ -50,28 +48,32 @@ def analyze_single_day(csv_path: Path) -> dict | None:
     exit_time = exit_row["ts"]
     exit_net_credit = float(exit_row["net_credit_close"])
 
-    # For a short credit spread, profit is entry credit - exit credit
-    total_pnl = entry_net_credit - exit_net_credit
+    # Use the final PNL value from the exit row in the CSV
+    total_pnl = exit_row["pnl"]
 
     # --- In-Trade P&L ---
     trade_slice = df.loc[entry_idx:exit_idx].copy()
-    trade_slice["pnl_bar"] = entry_net_credit - trade_slice["net_credit_close"]
+    # Max profit in a bar is when credit is lowest; Max loss is when credit is highest.
+    trade_slice["max_pnl_in_bar"] = (entry_net_credit - trade_slice["net_credit_low"])
+    trade_slice["min_pnl_in_bar"] = (entry_net_credit - trade_slice["net_credit_high"])
     
-    max_profit_trade_row = trade_slice.loc[trade_slice["pnl_bar"].idxmax()]
+    max_profit_trade_row = trade_slice.loc[trade_slice["max_pnl_in_bar"].idxmax()]
     max_profit_trade_time = max_profit_trade_row["ts"]
-    max_profit_trade = max_profit_trade_row["pnl_bar"]
-    max_loss_trade = trade_slice["pnl_bar"].min()
+    max_profit_trade = max_profit_trade_row["max_pnl_in_bar"]
+    max_loss_trade = trade_slice["min_pnl_in_bar"].min()
 
     # --- Full-Day P&L (relative to entry) ---
-    df["pnl_bar_day"] = entry_net_credit - df["net_credit_close"]
+    df_after_930 = df[df['ts'].dt.time >= pd.to_datetime('09:30').time()]
+    df_after_930["max_pnl_in_bar_day"] = (entry_net_credit - df_after_930["net_credit_low"])
+    df_after_930["min_pnl_in_bar_day"] = (entry_net_credit - df_after_930["net_credit_high"])
     
-    max_profit_day_row = df.loc[df["pnl_bar_day"].idxmax()]
+    max_profit_day_row = df_after_930.loc[df_after_930["max_pnl_in_bar_day"].idxmax()]
     max_profit_day_time = max_profit_day_row["ts"]
-    max_profit_day = max_profit_day_row["pnl_bar_day"]
+    max_profit_day = max_profit_day_row["max_pnl_in_bar_day"]
 
-    max_loss_day_row = df.loc[df["pnl_bar_day"].idxmin()]
+    max_loss_day_row = df_after_930.loc[df_after_930["min_pnl_in_bar_day"].idxmin()]
     max_loss_day_time = max_loss_day_row["ts"]
-    max_loss_day = max_loss_day_row["pnl_bar_day"]
+    max_loss_day = max_loss_day_row["min_pnl_in_bar_day"]
 
     first_hit = "PROFIT" if max_profit_day_time < max_loss_day_time else "LOSS"
 
@@ -94,17 +96,23 @@ def analyze_single_day(csv_path: Path) -> dict | None:
     return summary
 
 
-def main():
-    if not CONDOR_DIR.exists():
-        print(f"Iron Condor folder not found: {CONDOR_DIR}")
-        sys.exit(1)
+def process_and_display_summary(symbol: str):
+    """
+    Processes all CSVs for a given symbol and prints the summary.
+    """
+    condor_dir = BASE_DIR / symbol
+    out_path = BASE_DIR / f"{symbol}_summary.csv"
 
-    csv_files = sorted(CONDOR_DIR.glob("*.csv"))
+    if not condor_dir.exists():
+        print(f"Directory for {symbol.upper()} not found: {condor_dir}")
+        return
+
+    csv_files = sorted(condor_dir.glob("*.csv"))
     if not csv_files:
-        print(f"No CSV files found in {CONDOR_DIR}")
-        sys.exit(0)
+        print(f"No CSV files found in {condor_dir}")
+        return
 
-    print(f"Found {len(csv_files)} Iron Condor CSVs under {CONDOR_DIR}")
+    print(f"\nFound {len(csv_files)} {symbol.upper()} CSVs under {condor_dir}")
 
     summaries = []
     for csv_path in csv_files:
@@ -116,14 +124,14 @@ def main():
             print(f"Error processing {csv_path.name}: {e}")
 
     if not summaries:
-        print("No valid trades found in any CSVs.")
-        sys.exit(0)
+        print(f"No valid trades found for {symbol.upper()}.")
+        return
 
     summary_df = pd.DataFrame(summaries)
     summary_df.sort_values("date", inplace=True)
 
     # --- Manual Print with Fixed Width and Color ---
-    print("\n=== Iron Condor Strategy Summary ===")
+    print(f"\n=== {symbol.upper()} Iron Condor Strategy Summary ===")
     
     header = (
         f"{'date':<12}"
@@ -171,7 +179,7 @@ def main():
     max_day_loss = summary_df["total_pnl"].min()
     win_rate = (summary_df["total_pnl"] > 0).mean() * 100.0
 
-    print("\n=== Aggregate Stats ===")
+    print(f"\n=== {symbol.upper()} Aggregate Stats ===")
     pnl_color = Fore.GREEN if total_pnl_val >=0 else Fore.RED
     print(f"Total P&L (per lot): {pnl_color}{total_pnl_val:+.2f}{Style.RESET_ALL}")
     print(f"Max single-day profit: {max_day_profit:.2f}")
@@ -179,9 +187,15 @@ def main():
     print(f"Win rate: {win_rate:.1f}%")
 
     # Save the original, unformatted data to CSV
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    summary_df.to_csv(OUT_PATH, index=False)
-    print(f"\nSummary saved to {OUT_PATH}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_df.to_csv(out_path, index=False)
+    print(f"\nSummary for {symbol.upper()} saved to {out_path}")
+
+
+def main():
+    symbols = ["nifty", "sensex"]
+    for symbol in symbols:
+        process_and_display_summary(symbol)
 
 
 if __name__ == "__main__":

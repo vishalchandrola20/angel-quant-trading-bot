@@ -6,9 +6,9 @@ import time
 from datetime import date
 
 from src.api.smartapi_client import AngelAPI
-from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
+from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
 from src.strategy.strike_selection import get_single_ce_pe_strikes
-from src.market.contracts import find_nifty_option
+from src.market.contracts import find_option
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -27,22 +27,19 @@ def stream_ce_pe_ltp_for_first_15m(
       4. Continuously poll LTP for both via SmartAPI.ltpData every interval_sec seconds
     """
     # 1) First 15m close
-    close = get_nifty_first_15m_close(trading_date)
-    strikes_info = get_single_ce_pe_strikes(close)
+    spot, spot_candle_end_time = get_index_first_15m_close("NIFTY", trading_date)
+    strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, "NIFTY", trading_date)
 
-    spot = strikes_info["spot"]
-    atm = strikes_info["atm"]
     ce_strike = strikes_info["ce_strike"]
     pe_strike = strikes_info["pe_strike"]
 
     log.info("NIFTY first 15m close: %s", spot)
-    log.info("ATM (custom): %s", atm)
     log.info("CE strike: %s | PE strike: %s", ce_strike, pe_strike)
 
     # 2) Resolve contracts via Scrip Master
     # Auto expiry if not provided
-    ce_contract = find_nifty_option(ce_strike, "CE", expiry_str=expiry_str, trading_date=trading_date)
-    pe_contract = find_nifty_option(pe_strike, "PE", expiry_str=expiry_str, trading_date=trading_date)
+    ce_contract = find_option("NIFTY", ce_strike, "CE", expiry_str=expiry_str, trading_date=trading_date)
+    pe_contract = find_option("NIFTY", pe_strike, "PE", expiry_str=expiry_str, trading_date=trading_date)
 
     # 3) Login and start polling LTP
     api = AngelAPI()
@@ -91,20 +88,18 @@ def backtest_ce_pe_intraday_for_day(
       - Fetches intraday candles for CE & PE from 09:30 to 15:00/15:30
       - Prints each bar as if 'streaming' through the day
     """
-    close = get_nifty_first_15m_close(trading_date)
-    strikes_info = get_single_ce_pe_strikes(close)
+    spot, spot_candle_end_time = get_index_first_15m_close("NIFTY", trading_date)
+    strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, "NIFTY", trading_date)
 
-    spot = strikes_info["spot"]
-    atm = strikes_info["atm"]
     ce_strike = strikes_info["ce_strike"]
     pe_strike = strikes_info["pe_strike"]
 
-    log.info("Backtest NIFTY date=%s, first 15m close=%s, ATM=%s", trading_date, spot, atm)
+    log.info("Backtest NIFTY date=%s, first 15m close=%s", trading_date, spot)
     log.info("CE strike: %s | PE strike: %s", ce_strike, pe_strike)
 
     # Auto pick expiry for that day
-    ce_contract = find_nifty_option(ce_strike, "CE", expiry_str=expiry_str, trading_date=trading_date)
-    pe_contract = find_nifty_option(pe_strike, "PE", expiry_str=expiry_str, trading_date=trading_date)
+    ce_contract = find_option("NIFTY", ce_strike, "CE", expiry_str=expiry_str, trading_date=trading_date)
+    pe_contract = find_option("NIFTY", pe_strike, "PE", expiry_str=expiry_str, trading_date=trading_date)
 
     api = AngelAPI()
     api.login()
@@ -160,4 +155,3 @@ def backtest_ce_pe_intraday_for_day(
             f"{pe_contract.symbol} C={pe_close:.2f} | Sum={total_premium:.2f}"
         )
         # Later: plug strategy logic here (e.g., VWAP comparison, simulated trades)
-

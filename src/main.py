@@ -3,11 +3,10 @@ import argparse
 import time as time_module # Import time_module for sleep
 from datetime import datetime, time # Import time from datetime
 
-from src.data_pipeline.option_chain import fetch_and_save
-from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
+from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
 from src.strategy.strike_selection import get_single_ce_pe_strikes
 from src.api.smartapi_client import AngelAPI # Import AngelAPI
-from src.market.contracts import find_nifty_option # Import find_nifty_option
+from src.market.contracts import find_option # Import find_option
 
 
 from src.backtest.vwap_ce_pe_strategy import run_iron_condor_strategy_for_day, run_vwap_strangle_strategy_for_day
@@ -16,13 +15,13 @@ from src.backtest.vwap_straddle_strategy import run_vwap_straddle_strategy_for_d
 
 
 from src.market.ltp_stream import (
-    stream_ce_pe_ltp_for_first_15m,
     backtest_ce_pe_intraday_for_day,
 )
 
 
 
 def main():
+    global ohlc4_vwap, close_vwap, hlc3_vwap
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--task",
@@ -40,37 +39,14 @@ def main():
         default="option_chain",
     )
 
-    parser.add_argument("--symbol", default="NIFTY")
+    parser.add_argument("--index", default="NIFTY", help="Index for tasks: NIFTY or SENSEX")
     parser.add_argument("--date", help="Trading date in YYYY-MM-DD (for NIFTY tasks)")
     parser.add_argument("--expiry", help="Optional expiry like 27FEB2025; if omitted, auto-selected.")
     parser.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds for LTP stream")
     parser.add_argument("--time", help="Target time in HH:MM for calculate_vwap_until task") # New argument
     args = parser.parse_args()
 
-    if args.task == "option_chain":
-        out = fetch_and_save(args.symbol)
-        print("Saved option chain:", out)
-
-    elif args.task == "nifty_first_15m":
-        trading_date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else None
-        close = get_nifty_first_15m_close(trading_date)
-        print("NIFTY first 15m close:", close)
-
-    elif args.task == "nifty_first_15m_strikes":
-        trading_date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else None
-        close = get_nifty_first_15m_close(trading_date)
-        info = get_single_ce_pe_strikes(close)
-        print(f"NIFTY first 15m close: {info['spot']}")
-        print(f"ATM strike (custom rule): {info['atm']}")
-        print(f"CE strike: {info['ce_strike']}")
-        print(f"PE strike: {info['pe_strike']}")
-
-    elif args.task == "stream_ce_pe_ltp":
-        trading_date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else None
-        expiry_str = args.expiry or None
-        stream_ce_pe_ltp_for_first_15m(trading_date, expiry_str=expiry_str, interval_sec=args.interval)
-
-    elif args.task == "backtest_ce_pe_intraday":
+    if args.task == "backtest_ce_pe_intraday":
         if not args.date:
             raise SystemExit("--date is required for backtest_ce_pe_intraday")
         trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
@@ -115,10 +91,9 @@ def main():
 
         run_iron_condor_strategy_for_day(
             trading_date=trading_date,
+            index_name=args.index,
             bar_interval="ONE_MINUTE",
             expiry_str=expiry_str,
-            absolute_stop_loss=4000.0,
-            take_profit_points=1400.0,
             export_csv=True,
         )
     
@@ -130,17 +105,16 @@ def main():
         target_time = datetime.strptime(args.time, "%H:%M").time()
         target_dt = datetime.combine(trading_date, target_time)
 
-        first15_close = get_nifty_first_15m_close(trading_date)
-        strikes_info = get_single_ce_pe_strikes(first15_close)
-        short_ce_strike, short_pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
-        long_ce_strike = short_ce_strike + 8 * 50
-        long_pe_strike = short_pe_strike - 8 * 50
+        spot, spot_candle_end_time = get_index_first_15m_close("NIFTY", trading_date)
+        strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, "NIFTY", trading_date)
+        short_ce_strike, short_pe_strike, long_ce_strike, long_pe_strike = \
+            strikes_info["ce_strike"], strikes_info["pe_strike"], strikes_info["long_ce_strike"], strikes_info["long_pe_strike"]
 
         expiry_str = args.expiry or None
-        short_ce_contract = find_nifty_option(short_ce_strike, "CE", expiry_str, trading_date)
-        short_pe_contract = find_nifty_option(short_pe_strike, "PE", expiry_str, trading_date)
-        long_ce_contract = find_nifty_option(long_ce_strike, "CE", expiry_str, trading_date)
-        long_pe_contract = find_nifty_option(long_pe_strike, "PE", expiry_str, trading_date)
+        short_ce_contract = find_option("NIFTY", short_ce_strike, "CE", expiry_str, trading_date)
+        short_pe_contract = find_option("NIFTY", short_pe_strike, "PE", expiry_str, trading_date)
+        long_ce_contract = find_option("NIFTY", long_ce_strike, "CE", expiry_str, trading_date)
+        long_pe_contract = find_option("NIFTY", long_pe_strike, "PE", expiry_str, trading_date)
 
         api = AngelAPI()
         api.login()
