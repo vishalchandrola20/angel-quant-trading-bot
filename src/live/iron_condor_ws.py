@@ -59,7 +59,7 @@ class IronCondorLive:
             "spot_proximity_exit_points": 40,
             "take_profit_per_lot": 20.0,
             "absolute_stop_loss_per_lot": 20.0,
-            "trailing_activation_mtm_per_lot": 8.0, # 1000 / 50 lots
+            "trailing_activation_mtm_per_lot": 6.0, # 1000 / 50 lots
             "trailing_sl_reversal_pct": 0.70,
         },
 
@@ -74,7 +74,7 @@ class IronCondorLive:
             "spot_proximity_exit_points": 60,
             "take_profit_per_lot": 50.0,
             "absolute_stop_loss_per_lot": 50.0,
-            "trailing_activation_mtm_per_lot": 18, # 1000 / 60 lots
+            "trailing_activation_mtm_per_lot": 15, # 1000 / 60 lots
             "trailing_sl_reversal_pct": 0.70,
         }
     }
