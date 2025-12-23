@@ -1,12 +1,11 @@
 # 📈 Angel Quant Options Trading Bot
 
-A quantitative options trading bot built using **Angel One SmartAPI**, designed to analyze volatility, backtest strategies, and automate execution in Indian equity derivatives (NIFTY / BANKNIFTY).
+A quantitative options trading bot built using **Angel One SmartAPI**, designed to analyze volatility, backtest strategies, and automate execution in Indian equity derivatives (NIFTY / SENSEX).
 
 ---
 
 ## 🚀 Project Goals
 
-- Fetch & store live option chain + market data
 - Backtest data-driven options strategies
 - Automate trades based on volatility + Greeks
 - Manage risks with proper position sizing + SL/hedging
