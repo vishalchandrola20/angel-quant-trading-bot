@@ -266,7 +266,8 @@ def run_iron_condor_strategy_for_day(
                 if trailing_sl_active:
                     new_peak_mtm = max(peak_mtm, max_pnl_in_bar)
                     if new_peak_mtm > peak_mtm:
-                        log.info(f"Peak MTM updated to: {new_peak_mtm:.2f}")
+                        peak_mtm_points = new_peak_mtm / lot_size
+                        log.info(f"Peak MTM updated: Abs={new_peak_mtm:.2f} | Pts={peak_mtm_points:.2f}")
                         peak_mtm = new_peak_mtm
 
                     trailing_stop_level = peak_mtm * trailing_sl_reversal_pct

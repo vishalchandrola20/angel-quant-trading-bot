@@ -1,0 +1,13 @@
+NIFTY:
+  take_profit_per_lot: 20.0
+  absolute_stop_loss_per_lot: 20.0
+  trailing_activation_mtm_per_lot: 6.0
+  trailing_sl_reversal_pct: 0.70
+  spot_proximity_exit_points: 40
+
+SENSEX:
+  take_profit_per_lot: 50.0
+  absolute_stop_loss_per_lot: 50.0
+  trailing_activation_mtm_per_lot: 15.0
+  trailing_sl_reversal_pct: 0.80
+  spot_proximity_exit_points: 60

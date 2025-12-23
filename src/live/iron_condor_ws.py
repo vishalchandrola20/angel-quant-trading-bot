@@ -7,6 +7,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import yaml
 import logging
 import time as time_module
 from datetime import datetime, date, time as dt_time, timedelta
@@ -57,10 +59,6 @@ class IronCondorLive:
             "options_exchange_type": 2,
             "strike_step": 50,
             "spot_proximity_exit_points": 40,
-            "take_profit_per_lot": 20.0,
-            "absolute_stop_loss_per_lot": 20.0,
-            "trailing_activation_mtm_per_lot": 6.0, # 1000 / 50 lots
-            "trailing_sl_reversal_pct": 0.70,
         },
 
         "SENSEX": {
@@ -72,10 +70,6 @@ class IronCondorLive:
             "options_exchange_type": 4,
             "strike_step": 100,
             "spot_proximity_exit_points": 60,
-            "take_profit_per_lot": 50.0,
-            "absolute_stop_loss_per_lot": 50.0,
-            "trailing_activation_mtm_per_lot": 15, # 1000 / 60 lots
-            "trailing_sl_reversal_pct": 0.70,
         }
     }
 
@@ -99,21 +93,11 @@ class IronCondorLive:
         self.exchange_type = config["exchange_type"]
         self.options_exchange_type = config["options_exchange_type"]
         self.strike_step = config["strike_step"]
-        self.spot_proximity_exit_points = config["spot_proximity_exit_points"]
-        take_profit_per_lot = config["take_profit_per_lot"]
-        absolute_stop_loss_per_lot = config["absolute_stop_loss_per_lot"]
-        trailing_activation_mtm_per_lot = config["trailing_activation_mtm_per_lot"]
-        self.trailing_sl_reversal_pct = config["trailing_sl_reversal_pct"]
-        self.trailing_activation_mtm = trailing_activation_mtm_per_lot * self.lot_size
-
 
         self.trading_date = trading_date or date.today()
         self.expiry = expiry
         self.simulate_orders = simulate_orders
         self.vwap_recalc_interval = timedelta(minutes=vwap_recalc_interval_minutes)
-        
-        self.take_profit_points = take_profit_per_lot * self.lot_size
-        self.absolute_stop_loss = absolute_stop_loss_per_lot * self.lot_size
 
         self.api = AngelAPI()
         self.api.login()
@@ -138,13 +122,13 @@ class IronCondorLive:
 
         # Initialize all state variables
         self._reset_state()
+        
+        # Load dynamic strategy parameters from YAML
+        self.params_file_path = "config/strategy_params.yaml"
+        self.last_params_mtime = 0
+        self._load_strategy_params()
 
-        log.info(
-            f"Strategy configured with TP: {self.take_profit_points:.2f} ({take_profit_per_lot}/lot), "
-            f"Abs SL: {self.absolute_stop_loss:.2f} ({absolute_stop_loss_per_lot}/lot)"
-        )
-
-
+        
     def _ensure_csv(self):
         self.closed_pnl = 0.0
         if not self.csv_path.exists():
@@ -205,6 +189,34 @@ class IronCondorLive:
         except Exception as e:
             log.error(f"Failed to fetch historical candles for {contract.symbol}: {e}")
             return []
+
+    def _load_strategy_params(self):
+        """Loads strategy parameters from the YAML file."""
+        with open(self.params_file_path, 'r') as f:
+            params = yaml.safe_load(f)
+        
+        index_params = params.get(self.index_name, {})
+        self.take_profit_per_lot = index_params.get("take_profit_per_lot", 20.0)
+        self.absolute_stop_loss_per_lot = index_params.get("absolute_stop_loss_per_lot", 20.0)
+        self.trailing_activation_mtm_per_lot = index_params.get("trailing_activation_mtm_per_lot", 6.0)
+        self.trailing_sl_reversal_pct = index_params.get("trailing_sl_reversal_pct", 0.70)
+        self.spot_proximity_exit_points = index_params.get("spot_proximity_exit_points", 40)
+
+        self.take_profit_points = self.take_profit_per_lot * self.lot_size
+        self.absolute_stop_loss = self.absolute_stop_loss_per_lot * self.lot_size
+        self.trailing_activation_mtm = self.trailing_activation_mtm_per_lot * self.lot_size
+        log.info(f"Loaded strategy params for {self.index_name}: TP={self.take_profit_points:.2f}, SL={self.absolute_stop_loss:.2f}, TrailingActivation={self.trailing_activation_mtm:.2f}")
+
+    def _reload_params_if_changed(self):
+        """Checks if the params file has been modified and reloads it."""
+        try:
+            mtime = os.path.getmtime(self.params_file_path)
+            if mtime > self.last_params_mtime:
+                log.warning("Detected change in strategy_params.yaml. Reloading parameters...")
+                self._load_strategy_params()
+                self.last_params_mtime = mtime
+        except Exception as e:
+            log.error(f"Could not reload strategy params: {e}")
 
     def prepare_contracts(self):
         spot, spot_candle_end_time = get_index_first_15m_close(self.index_name, self.trading_date)
@@ -492,6 +504,8 @@ class IronCondorLive:
         self._close_ws()
 
     def _process_strategy_on_tick(self, updated_token: str, updated_ltp: float, updated_vol: float):
+        self._reload_params_if_changed()
+        
         now = datetime.now()
         if not self.trading_active:
             return
@@ -555,7 +569,8 @@ class IronCondorLive:
             if self.trailing_sl_active:
                 new_peak_mtm = max(self.peak_mtm, total_pnl)
                 if new_peak_mtm > self.peak_mtm:
-                    log.info(f"{Fore.MAGENTA}Peak MTM updated to:: {new_peak_mtm:.2f}{Style.RESET_ALL}")
+                    peak_mtm_points = new_peak_mtm / self.lot_size
+                    log.info(f"{Fore.MAGENTA}Peak MTM updated: Abs={new_peak_mtm:.2f} | Pts={peak_mtm_points:.2f}{Style.RESET_ALL}")
                     self.peak_mtm = new_peak_mtm
 
                 trailing_stop_level = self.peak_mtm * self.trailing_sl_reversal_pct
