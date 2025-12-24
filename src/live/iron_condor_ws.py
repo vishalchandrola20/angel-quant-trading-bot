@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import yaml
+import math
 import logging
 import time as time_module
 from datetime import datetime, date, time as dt_time, timedelta
@@ -151,6 +152,7 @@ class IronCondorLive:
         self.trading_active = True # Flag to control the main trading loop
         self.trailing_sl_active = False
         self.peak_mtm = 0.0
+        self.last_reversal_pct = 0.0
 
         self.events_dir = Path("data/live")
         self.events_dir.mkdir(parents=True, exist_ok=True)
@@ -198,21 +200,32 @@ class IronCondorLive:
         index_params = params.get(self.index_name, {})
         self.take_profit_per_lot = index_params.get("take_profit_per_lot", 20.0)
         self.absolute_stop_loss_per_lot = index_params.get("absolute_stop_loss_per_lot", 20.0)
-        self.trailing_activation_mtm_per_lot = index_params.get("trailing_activation_mtm_per_lot", 6.0)
-        self.trailing_sl_reversal_pct = index_params.get("trailing_sl_reversal_pct", 0.70)
         self.spot_proximity_exit_points = index_params.get("spot_proximity_exit_points", 40)
+
+        # Load trailing stop configuration
+        self.trailing_stop_config = index_params.get("trailing_stop", {})
+        if self.trailing_stop_config.get("tiers"):
+            # Sort tiers descending by profit threshold to simplify lookup
+            self.trailing_stop_config["tiers"].sort(key=lambda x: x['pnl_above'], reverse=True)
+
+        # Calculate activation MTM based on points
+        activation_points = self.trailing_stop_config.get("activation_points", 6.0)
+        self.trailing_activation_mtm = activation_points * self.lot_size
 
         self.take_profit_points = self.take_profit_per_lot * self.lot_size
         self.absolute_stop_loss = self.absolute_stop_loss_per_lot * self.lot_size
-        self.trailing_activation_mtm = self.trailing_activation_mtm_per_lot * self.lot_size
-        log.info(f"Loaded strategy params for {self.index_name}: TP={self.take_profit_points:.2f}, SL={self.absolute_stop_loss:.2f}, TrailingActivation={self.trailing_activation_mtm:.2f}")
+        log.info(
+            f"{Fore.CYAN}Loaded strategy params for {self.index_name}: "
+            f"TP={self.take_profit_points:.2f}, SL={self.absolute_stop_loss:.2f}, "
+            f"TrailingActivation={self.trailing_activation_mtm:.2f} ({activation_points} pts){Style.RESET_ALL}"
+        )
 
     def _reload_params_if_changed(self):
         """Checks if the params file has been modified and reloads it."""
         try:
             mtime = os.path.getmtime(self.params_file_path)
             if mtime > self.last_params_mtime:
-                log.warning("Detected change in strategy_params.yaml. Reloading parameters...")
+                log.warning(f"{Fore.YELLOW}Detected change in strategy_params.yaml. Reloading parameters...{Style.RESET_ALL}")
                 self._load_strategy_params()
                 self.last_params_mtime = mtime
         except Exception as e:
@@ -243,6 +256,33 @@ class IronCondorLive:
         l_ce_vwap = get_leg_vwap("l_ce")
         l_pe_vwap = get_leg_vwap("l_pe")
         return (s_ce_vwap + s_pe_vwap) - (l_ce_vwap + l_pe_vwap)
+
+    def _get_trailing_reversal_pct(self) -> float:
+        """Determines the current trailing SL reversal percentage based on peak MTM."""
+        config = self.trailing_stop_config
+        peak = self.peak_mtm
+
+        # Default to the lowest tier's percentage if no other condition is met
+        base_pct = 0.0
+        if config.get('tiers'):
+            base_pct = config['tiers'][-1]['reversal_pct']
+
+        # Check for incremental increase
+        increment_config = config.get('increment')
+        if increment_config and peak > increment_config['base_pnl']:
+            base_tier_pct = next((t['reversal_pct'] for t in config['tiers'] if increment_config['base_pnl'] >= t['pnl_above']), base_pct)
+            pnl_above_base = peak - increment_config['base_pnl']
+            num_steps = math.floor(pnl_above_base / increment_config['pnl_step'])
+            pct_increase = num_steps * increment_config['pct_increase']
+            final_pct = base_tier_pct + pct_increase
+            return min(final_pct, increment_config.get('max_pct', 0.95))
+
+        # Check static tiers (sorted descending by pnl_above)
+        for tier in config.get('tiers', []):
+            if peak >= tier['pnl_above']:
+                return tier['reversal_pct']
+
+        return base_pct
 
     def _recalculate_vwap_from_history(self, current_dt: datetime):
         """Fetches all 1-min bars from day start and recalculates VWAP for all legs."""
@@ -573,9 +613,14 @@ class IronCondorLive:
                     log.info(f"{Fore.MAGENTA}Peak MTM updated: Abs={new_peak_mtm:.2f} | Pts={peak_mtm_points:.2f}{Style.RESET_ALL}")
                     self.peak_mtm = new_peak_mtm
 
-                trailing_stop_level = self.peak_mtm * self.trailing_sl_reversal_pct
+                current_reversal_pct = self._get_trailing_reversal_pct()
+                if current_reversal_pct != self.last_reversal_pct:
+                    log.info(f"{Fore.CYAN}Trailing SL percentage updated to: {current_reversal_pct*100:.0f}%{Style.RESET_ALL}")
+                    self.last_reversal_pct = current_reversal_pct
+
+                trailing_stop_level = self.peak_mtm * current_reversal_pct
                 if total_pnl <= trailing_stop_level:
-                    log.info(f"{Fore.MAGENTA}Trailing SL triggered. Current PNL {total_pnl:.2f} <= 70% of Peak PNL {self.peak_mtm:.2f}{Style.RESET_ALL}")
+                    log.info(f"{Fore.MAGENTA}Trailing SL triggered. Current PNL {total_pnl:.2f} <= {current_reversal_pct*100:.0f}% of Peak PNL {self.peak_mtm:.2f}{Style.RESET_ALL}")
                     self._execute_exit(exit_reason="TRAILING_STOP_LOSS")
 
     def run(self):
