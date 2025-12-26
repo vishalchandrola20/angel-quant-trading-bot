@@ -116,6 +116,7 @@ class IronCondorLive:
         self.trading_active = True
         self.trailing_sl_active = False
         self.peak_mtm = 0.0
+        self.last_activation_reduction_hour = 0
         self.entry_info: Dict[str, Any] = {}
         self.exit_info: Dict[str, Any] = {}
 
@@ -153,6 +154,7 @@ class IronCondorLive:
         self.trailing_sl_active = False
         self.peak_mtm = 0.0
         self.last_reversal_pct = 0.0
+        self.last_activation_reduction_hour = 0
 
         self.events_dir = Path("data/live")
         self.events_dir.mkdir(parents=True, exist_ok=True)
@@ -257,10 +259,10 @@ class IronCondorLive:
         l_pe_vwap = get_leg_vwap("l_pe")
         return (s_ce_vwap + s_pe_vwap) - (l_ce_vwap + l_pe_vwap)
 
-    def _get_trailing_reversal_pct(self) -> float:
-        """Determines the current trailing SL reversal percentage based on peak MTM."""
+    def _get_trailing_reversal_pct(self, peak_pnl: float) -> float:
+        """Determines the trailing SL reversal percentage for a given peak MTM."""
         config = self.trailing_stop_config
-        peak = self.peak_mtm
+        peak = peak_pnl
 
         # Default to the lowest tier's percentage if no other condition is met
         base_pct = 0.0
@@ -365,6 +367,7 @@ class IronCondorLive:
             self.short_pe_stop = self.entry_info["short_pe_entry"] * 2.20
             self.trailing_sl_active = False # Reset for new position
             self.peak_mtm = 0.0
+            self.last_activation_reduction_hour = 0
             log.info(f"Resumed with entry prices and SLs.")
         else:
             log.info("No complete Iron Condor position found to resume.")
@@ -511,6 +514,7 @@ class IronCondorLive:
         log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | Iron Condor position entered at {self.index_name} {index_entry_price}.")
         self.trailing_sl_active = False # Reset for new position
         self.peak_mtm = 0.0
+        self.last_activation_reduction_hour = 0
 
     def _execute_exit(self, exit_reason="STRATEGY_EXIT"):
         log.info(f"event=ORDER_EXIT_INIT | Triggered by: {exit_reason}")
@@ -599,8 +603,38 @@ class IronCondorLive:
             elif nifty_ltp <= (self.short_pe_contract.strike + self.spot_proximity_exit_points) or \
                 nifty_ltp >= (self.short_ce_contract.strike - self.spot_proximity_exit_points):
                 self._execute_exit(exit_reason="SPOT_NEAR_STRIKE")
-            
-            # Trailing Stop Loss on Profit
+
+                # --- Dynamic Trailing Activation Threshold ---
+            if not self.trailing_sl_active:
+                entry_dt = datetime.fromisoformat(self.entry_info['ts'])
+                hours_passed = math.floor((now - entry_dt).total_seconds() / 30)
+
+                if hours_passed > self.last_activation_reduction_hour:
+                    # Define reduction values
+                    reduction_per_hour = 2.5 if self.index_name == "SENSEX" else 1.0
+                    min_activation_points = 2.5 if self.index_name == "SENSEX" else 1.0
+
+                    # Calculate how many new hours have passed to apply reduction
+                    hours_to_reduce_for = hours_passed - self.last_activation_reduction_hour
+                    total_reduction_points = hours_to_reduce_for * reduction_per_hour
+
+                    # Get current activation points to reduce from
+                    current_activation_points = self.trailing_activation_mtm / self.lot_size
+                    new_activation_points = max(min_activation_points, current_activation_points - total_reduction_points)
+
+                    # Update the MTM threshold
+                    self.trailing_activation_mtm = new_activation_points * self.lot_size
+
+                    # Calculate what the SL would be at this new level for logging
+                    reversal_pct_at_new_level = self._get_trailing_reversal_pct(self.trailing_activation_mtm)
+                    sl_trigger_value = self.trailing_activation_mtm * reversal_pct_at_new_level
+                    sl_trigger_points = sl_trigger_value / self.lot_size
+
+                    log.warning(f"{Fore.YELLOW}Time in trade > {hours_passed}hr. Trailing Activation reduced to: {self.trailing_activation_mtm:,.2f} ({new_activation_points:.2f} pts). "
+                                f"New SL trigger at ~{sl_trigger_points:.2f} pts ({reversal_pct_at_new_level*100:.0f}%){Style.RESET_ALL}")
+                    self.last_activation_reduction_hour = hours_passed
+
+        # Trailing Stop Loss on Profit
             if not self.trailing_sl_active and total_pnl >= self.trailing_activation_mtm:
                 self.trailing_sl_active = True
                 self.peak_mtm = total_pnl
@@ -613,7 +647,7 @@ class IronCondorLive:
                     log.info(f"{Fore.MAGENTA}Peak MTM updated: Abs={new_peak_mtm:.2f} | Pts={peak_mtm_points:.2f}{Style.RESET_ALL}")
                     self.peak_mtm = new_peak_mtm
 
-                current_reversal_pct = self._get_trailing_reversal_pct()
+                current_reversal_pct = self._get_trailing_reversal_pct(self.peak_mtm)
                 if current_reversal_pct != self.last_reversal_pct:
                     log.info(f"{Fore.CYAN}Trailing SL percentage updated to: {current_reversal_pct*100:.0f}%{Style.RESET_ALL}")
                     self.last_reversal_pct = current_reversal_pct

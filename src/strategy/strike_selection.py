@@ -112,7 +112,7 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             hedge_offset = 700
         else:  # More than 3 days
             strike_offset = 800
-            hedge_offset = 700
+            hedge_offset = 800
         log.info(f"SENSEX expiry is in {days_to_expiry} days. Selected strike offset: {strike_offset}, hedge offset: {hedge_offset}")
     else:  # Default to NIFTY
         strike_offset = 150
@@ -182,7 +182,14 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
 
 if __name__ == "__main__":
     test_spot = 26229.65
-    # For testing historical dates, you need to provide a date
-    # info = get_single_ce_pe_strikes(test_spot, trading_date=date(2023, 12, 8))
-    info = get_single_ce_pe_strikes(test_spot)
+    # For testing, we need a trading_date and a spot_candle_end_time
+    test_trading_date = date.today()
+    # Let's assume the spot price is from the 9:30 candle for this test
+    test_spot_candle_end_time = datetime.combine(test_trading_date, datetime.min.time()).replace(hour=9, minute=30)
+
+    info = get_single_ce_pe_strikes(
+        spot=test_spot,
+        spot_candle_end_time=test_spot_candle_end_time,
+        trading_date=test_trading_date
+    )
     print(info)
