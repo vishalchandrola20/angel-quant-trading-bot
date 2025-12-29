@@ -28,7 +28,7 @@ INDEX_CONFIG = {
         "strike_step": 50,
         "spot_proximity_exit_points": 40,
         "take_profit_per_lot": 20.0,
-        "absolute_stop_loss_per_lot": 20.0,
+        "absolute_stop_loss_per_lot": 6.0,
         "trailing_activation_mtm_per_lot": 8.0, # 1000 / 50 lots
         "trailing_sl_reversal_pct": 0.70,
     },
@@ -43,7 +43,7 @@ INDEX_CONFIG = {
         "strike_step": 100,
         "spot_proximity_exit_points": 60,
         "take_profit_per_lot": 50.0,
-        "absolute_stop_loss_per_lot": 50.0,
+        "absolute_stop_loss_per_lot": 20.0,
         "trailing_activation_mtm_per_lot": 20, # 1000 / 60 lots
         "trailing_sl_reversal_pct": 0.70,
     }
@@ -243,8 +243,6 @@ def run_iron_condor_strategy_for_day(
                 max_pnl_in_bar = (entry_net_credit - bar.net_credit_low) * lot_size
                 # Max loss in the bar occurs at the highest credit value.
                 min_pnl_in_bar = (entry_net_credit - bar.net_credit_high) * lot_size
-                log.info(f"bar.net_credit_high={bar.net_credit_high}")
-                log.info(f"entry_net_credit={entry_net_credit}")
 
                 # PNL at the close of the bar for final calculation if an exit is triggered.
                 pnl_at_close = (entry_net_credit - bar.net_credit_close) * lot_size

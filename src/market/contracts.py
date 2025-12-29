@@ -177,5 +177,5 @@ def get_next_expiry(index_name: str, trading_date: date | None = None) -> str:
         raise RuntimeError(f"No {index_name} option expiry found on or after {trading_date}")
 
     dt, expiry_str = min(expiries, key=lambda x: x[0])
-    log.info("Auto-selected %s expiry %s for trading date %s", index_name, expiry_str, trading_date)
+    #log.info("Auto-selected %s expiry %s for trading date %s", index_name, expiry_str, trading_date)
     return expiry_str

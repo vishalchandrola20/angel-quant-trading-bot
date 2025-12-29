@@ -155,6 +155,7 @@ class IronCondorLive:
         self.peak_mtm = 0.0
         self.last_reversal_pct = 0.0
         self.last_activation_reduction_hour = 0
+        self.credit_decay_tp_level = 0.0
 
         self.events_dir = Path("data/live")
         self.events_dir.mkdir(parents=True, exist_ok=True)
@@ -202,6 +203,7 @@ class IronCondorLive:
         index_params = params.get(self.index_name, {})
         self.take_profit_per_lot = index_params.get("take_profit_per_lot", 20.0)
         self.absolute_stop_loss_per_lot = index_params.get("absolute_stop_loss_per_lot", 20.0)
+        self.individual_leg_sl_multiplier = index_params.get("individual_leg_sl_multiplier", 2.25)
         self.spot_proximity_exit_points = index_params.get("spot_proximity_exit_points", 40)
 
         # Load trailing stop configuration
@@ -219,7 +221,8 @@ class IronCondorLive:
         log.info(
             f"{Fore.CYAN}Loaded strategy params for {self.index_name}: "
             f"TP={self.take_profit_points:.2f}, SL={self.absolute_stop_loss:.2f}, "
-            f"TrailingActivation={self.trailing_activation_mtm:.2f} ({activation_points} pts){Style.RESET_ALL}"
+            f"TrailingActivation={self.trailing_activation_mtm:.2f} ({activation_points} pts), "
+            f"LegSLMultiplier={self.individual_leg_sl_multiplier}x{Style.RESET_ALL}"
         )
 
     def _reload_params_if_changed(self):
@@ -258,6 +261,38 @@ class IronCondorLive:
         l_ce_vwap = get_leg_vwap("l_ce")
         l_pe_vwap = get_leg_vwap("l_pe")
         return (s_ce_vwap + s_pe_vwap) - (l_ce_vwap + l_pe_vwap)
+
+    def _set_credit_decay_tp_level(self):
+        """Calculates and sets the credit decay TP level based on entry credit."""
+        if not self.in_position or 'short_ce_entry' not in self.entry_info:
+            self.credit_decay_tp_level = 0.0
+            return
+
+        entry_net_credit = (self.entry_info['short_ce_entry'] + self.entry_info['short_pe_entry']) - \
+                           (self.entry_info['long_ce_entry'] + self.entry_info['long_pe_entry'])
+
+        target_credit_decay_pct = 0.0
+        if self.index_name == "SENSEX":
+            if entry_net_credit > 105:
+                target_credit_decay_pct = 0.55  # PNL is 45% of entry credit
+            elif 90 < entry_net_credit <= 105:
+                target_credit_decay_pct = 0.50  # PNL is 50% of entry credit
+            else:  # <= 90
+                target_credit_decay_pct = 0.45  # PNL is 55% of entry credit
+        else:  # NIFTY
+            if entry_net_credit > 42:
+                target_credit_decay_pct = 0.55  # PNL is 45% of entry credit
+            elif 30 < entry_net_credit <= 42:
+                target_credit_decay_pct = 0.50  # PNL is 50% of entry credit
+            else:  # Covers range <= 30
+                target_credit_decay_pct = 0.45  # PNL is 55% of entry credit
+
+        if target_credit_decay_pct > 0:
+            self.credit_decay_tp_level = entry_net_credit * target_credit_decay_pct
+            log.info(
+                f"{Fore.CYAN}Credit Decay TP target set to: {self.credit_decay_tp_level:.2f} (when credit drops below this value){Style.RESET_ALL}")
+        else:
+            self.credit_decay_tp_level = 0.0
 
     def _get_trailing_reversal_pct(self, peak_pnl: float) -> float:
         """Determines the trailing SL reversal percentage for a given peak MTM."""
@@ -363,11 +398,10 @@ class IronCondorLive:
                 "long_pe_entry": float(l_pe['buyavgprice']),
                 "nifty_entry_price": index_ltp,
             }
-            self.short_ce_stop = self.entry_info["short_ce_entry"] * 2.20
-            self.short_pe_stop = self.entry_info["short_pe_entry"] * 2.20
             self.trailing_sl_active = False # Reset for new position
             self.peak_mtm = 0.0
             self.last_activation_reduction_hour = 0
+            self._set_credit_decay_tp_level()
             log.info(f"Resumed with entry prices and SLs.")
         else:
             log.info("No complete Iron Condor position found to resume.")
@@ -471,6 +505,7 @@ class IronCondorLive:
                 "long_ce_entry": sim_lc_entry, "long_pe_entry": sim_lp_entry,
                 "nifty_entry_price": sim_index_entry,
             }
+            self._set_credit_decay_tp_level()
             log.info(f"{Fore.GREEN}SIMULATION: ENTRY CONFIRMED | Iron Condor position entered at {self.index_name} {sim_index_entry:.2f}.")
             return
         
@@ -509,12 +544,11 @@ class IronCondorLive:
             "long_ce_entry": float(lc_details['averageprice']), "long_pe_entry": float(lp_details['averageprice']),
             "nifty_entry_price": index_entry_price,
         }
-        self.short_ce_stop = self.entry_info["short_ce_entry"] * 1.70
-        self.short_pe_stop = self.entry_info["short_pe_entry"] * 1.70
         log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | Iron Condor position entered at {self.index_name} {index_entry_price}.")
         self.trailing_sl_active = False # Reset for new position
         self.peak_mtm = 0.0
         self.last_activation_reduction_hour = 0
+        self._set_credit_decay_tp_level()
 
     def _execute_exit(self, exit_reason="STRATEGY_EXIT"):
         log.info(f"event=ORDER_EXIT_INIT | Triggered by: {exit_reason}")
@@ -595,6 +629,11 @@ class IronCondorLive:
             pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
             log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f}, VWAP={vwap:.2f} | Open PNL: {open_pnl:+.2f}, Closed PNL: {self.closed_pnl:+.2f}, Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
 
+            # --- CREDIT DECAY TAKE PROFIT (Primary TP) ---
+            if self.credit_decay_tp_level > 0 and net_credit <= self.credit_decay_tp_level:
+                log.info(f"{Fore.GREEN}Credit Decay TP hit. Current Credit: {net_credit:.2f} <= Target: {self.credit_decay_tp_level:.2f}{Style.RESET_ALL}")
+                self._execute_exit(exit_reason="CREDIT_DECAY_TP")
+                return  # Exit immediately
             if total_pnl >= self.take_profit_points:
                 self._execute_exit(exit_reason="TAKE_PROFIT")
             elif total_pnl <= -self.absolute_stop_loss:
@@ -603,11 +642,15 @@ class IronCondorLive:
             elif nifty_ltp <= (self.short_pe_contract.strike + self.spot_proximity_exit_points) or \
                 nifty_ltp >= (self.short_ce_contract.strike - self.spot_proximity_exit_points):
                 self._execute_exit(exit_reason="SPOT_NEAR_STRIKE")
+            # New condition: Individual leg stop loss
+            elif s_ce_ltp >= (self.entry_info['short_ce_entry'] * self.individual_leg_sl_multiplier) or \
+                 s_pe_ltp >= (self.entry_info['short_pe_entry'] * self.individual_leg_sl_multiplier):
+                self._execute_exit(exit_reason="INDIVIDUAL_LEG_SL")
 
                 # --- Dynamic Trailing Activation Threshold ---
             if not self.trailing_sl_active:
                 entry_dt = datetime.fromisoformat(self.entry_info['ts'])
-                hours_passed = math.floor((now - entry_dt).total_seconds() / 30)
+                hours_passed = math.floor((now - entry_dt).total_seconds() / 3600)
 
                 if hours_passed > self.last_activation_reduction_hour:
                     # Define reduction values
