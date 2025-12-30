@@ -67,10 +67,25 @@ def get_index_first_15m_close(index_name: str, trading_date: date | None = None)
         "todate": to_str,
     }
 
-    res = api.connection.getCandleData(params)
-    candles = res.get("data") or []
+    candles = None
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            res = api.connection.getCandleData(params)
+            if res and res.get("data"):
+                candles = res.get("data")
+                break  # Success
+            else:
+                log.warning(f"Attempt {attempt + 1}/{max_retries}: No candle data for {index_name}. Response: {res}")
+        except Exception as e:
+            log.warning(f"Attempt {attempt + 1}/{max_retries}: API call failed for {index_name}: {e}")
+
+        if attempt < max_retries - 1:
+            log.info("Waiting 2 seconds before retrying...")
+            time_module.sleep(2)
+
     if not candles:
-        raise RuntimeError(f"No candle data returned for {index_name} in range {from_str} → {to_str}")
+        raise RuntimeError(f"Failed to get candle data for {index_name} after {max_retries} attempts.")
 
     first = candles[0]
     ts, o, h, l, c, vol = first

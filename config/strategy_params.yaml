@@ -1,7 +1,8 @@
 NIFTY:
   take_profit_per_lot: 20.0
-  absolute_stop_loss_per_lot: 8.0
+  absolute_stop_loss_per_lot: 6.0
   spot_proximity_exit_points: 40
+  individual_leg_sl_multiplier: 2
   trailing_stop:
     activation_points: 4.0 # Activation at 6 points * 150 lot = 900 Rs
     tiers: # Must be sorted in descending order of pnl_above
@@ -18,8 +19,9 @@ NIFTY:
 
 SENSEX:
   take_profit_per_lot: 50.0
-  absolute_stop_loss_per_lot: 20.0
+  absolute_stop_loss_per_lot: 15.0
   spot_proximity_exit_points: 100
+  individual_leg_sl_multiplier: 2
   trailing_stop:
     activation_points: 10.0 # Activation at 15 points * 60 lot = 900 Rs
     tiers: # Must be sorted in descending order of pnl_above
