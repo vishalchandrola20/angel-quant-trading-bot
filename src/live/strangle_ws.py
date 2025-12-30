@@ -17,8 +17,8 @@ from collections import defaultdict
 from colorama import Fore, Style, init as colorama_init
 
 from src.api.smartapi_client import AngelAPI
-from src.data_pipeline.nifty_first_15m import get_nifty_first_15m_close
-from src.market.contracts import find_nifty_option, OptionContract
+from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
+from src.market.contracts import find_option, OptionContract
 from src.strategy.strike_selection import get_single_ce_pe_strikes
 
 # Initialize colorama
@@ -119,7 +119,7 @@ class StrangleLive:
         """Helper to fetch historical 1-minute candles."""
         from_str = from_dt.strftime("%Y-%m-%d %H:%M")
         to_str = to_dt.strftime("%Y-%m-%d %H:%M")
-        log.info(f"Fetching historical candles for {contract.symbol} from {from_str} to {to_str}")
+        #log.info(f"Fetching historical candles for {contract.symbol} from {from_str} to {to_str}")
         try:
             payload = {
                 "exchange": contract.exchange,
@@ -138,13 +138,13 @@ class StrangleLive:
         """
         Selects contracts and pre-fills VWAP with historical data from 9:15 AM using OHLC/4.
         """
-        first15 = get_nifty_first_15m_close(self.trading_date)
-        strikes_info = get_single_ce_pe_strikes(first15)
+        spot, spot_candle_end_time = get_index_first_15m_close("NIFTY", self.trading_date)
+        strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, "NIFTY", self.trading_date)
         ce_strike, pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
         log.info(f"event=SETUP | Initial strikes: CE={ce_strike}, PE={pe_strike}")
 
-        self.ce_contract = find_nifty_option(ce_strike, "CE", self.expiry, self.trading_date)
-        self.pe_contract = find_nifty_option(pe_strike, "PE", self.expiry, self.trading_date)
+        self.ce_contract = find_option("NIFTY",ce_strike, "CE", self.expiry, self.trading_date)
+        self.pe_contract = find_option("NIFTY",pe_strike, "PE", self.expiry, self.trading_date)
         
         now = datetime.now()
         start_of_day = datetime.combine(self.trading_date, dt_time(9, 15))
@@ -279,7 +279,7 @@ class StrangleLive:
         pe_details = self._poll_order_status(pe_order_id)
 
         if not ce_details or not pe_details:
-            log.error("One or both entry orders failed. Exiting all legs."); 
+            log.error("One or both entry orders failed. Exiting all legs.")
             self._execute_exit(ce_only=bool(ce_details), pe_only=bool(pe_details), exit_reason="PARTIAL_ENTRY_FAILED"); return
 
         self.in_position = True
