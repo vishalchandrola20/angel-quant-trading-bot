@@ -142,12 +142,7 @@ class IronCondorLive:
 
     def _reset_state(self):
         """Resets all strategy state variables."""
-        self.individual_leg_vwap_accumulators: Dict[str, Dict[str, float]] = {
-            "s_ce": {"cum_pv": 0.0, "cum_vol": 0.0},
-            "s_pe": {"cum_pv": 0.0, "cum_vol": 0.0},
-            "l_ce": {"cum_pv": 0.0, "cum_vol": 0.0},
-            "l_pe": {"cum_pv": 0.0, "cum_vol": 0.0},
-        }
+        self.index_vwap_accumulator: Dict[str, float] = {"cum_pv": 0.0, "cum_vol": 0.0}
 
         self.in_position = False
         self.trading_active = True # Flag to control the main trading loop
@@ -177,23 +172,36 @@ class IronCondorLive:
 
     def _get_historical_candles(self, contract: OptionContract, from_dt: datetime, to_dt: datetime) -> list:
         time_module.sleep(0.5) # Rate limit API calls
-        # Add 1 minute to to_dt to ensure the current (incomplete) bar is included in the fetch window
         to_dt_adjusted = to_dt + timedelta(minutes=1)
         from_str, to_str = from_dt.strftime("%Y-%m-%d %H:%M"), to_dt_adjusted.strftime("%Y-%m-%d %H:%M")
         log.info(f"Fetching historical candles for {contract.symbol} from {from_str} to {to_str}")
-        try:
-            payload = {
-                "exchange": contract.exchange,
-                "symboltoken": contract.token,
-                "interval": "ONE_MINUTE",
-                "fromdate": from_str,
-                "todate": to_str,
-            }
-            candle_data = self.api.connection.getCandleData(payload)
-            return candle_data.get("data", []) or []
-        except Exception as e:
-            log.error(f"Failed to fetch historical candles for {contract.symbol}: {e}")
-            return []
+
+        payload = {
+            "exchange": contract.exchange,
+            "symboltoken": contract.token,
+            "interval": "ONE_MINUTE",
+            "fromdate": from_str,
+            "todate": to_str,
+        }
+
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                res = self.api.connection.getCandleData(payload)
+                if res and res.get("data"):
+                    return res.get("data", [])  # Success
+
+                log.warning(f"Attempt {attempt + 1}/{max_retries}: No data for {contract.symbol}. Response: {res}")
+
+            except Exception as e:
+                log.warning(f"Attempt {attempt + 1}/{max_retries}: API call failed for {contract.symbol}: {e}")
+
+            if attempt < max_retries - 1:
+                log.info("Waiting 2 seconds before retrying...")
+                time_module.sleep(2)
+
+        log.error(f"Failed to fetch historical candles for {contract.symbol} after {max_retries} attempts.")
+        return []
 
     def _load_strategy_params(self):
         """Loads strategy parameters from the YAML file."""
@@ -262,6 +270,11 @@ class IronCondorLive:
         l_pe_vwap = get_leg_vwap("l_pe")
         return (s_ce_vwap + s_pe_vwap) - (l_ce_vwap + l_pe_vwap)
 
+    def _get_index_vwap(self) -> float:
+        """Calculates the VWAP for the underlying index."""
+        acc = self.index_vwap_accumulator
+        return acc["cum_pv"] / acc["cum_vol"] if acc["cum_vol"] > 0 else 0.0
+
     def _set_credit_decay_tp_level(self):
         """Calculates and sets the credit decay TP level based on entry credit."""
         if not self.in_position or 'short_ce_entry' not in self.entry_info:
@@ -322,38 +335,36 @@ class IronCondorLive:
         return base_pct
 
     def _recalculate_vwap_from_history(self, current_dt: datetime):
-        """Fetches all 1-min bars from day start and recalculates VWAP for all legs."""
-        log.info(f"event=VWAP_RECALC | Triggered at {current_dt.time()}. Fetching fresh 1-min bars.")
+        """Fetches all 1-min bars for the index from day start and recalculates its VWAP."""
+        log.info(f"event=VWAP_RECALC | Triggered for Index VWAP at {current_dt.time()}.")
         start_of_day = datetime.combine(self.trading_date, dt_time(9, 15))
 
-        # Fetch historical data for all legs
-        hist_bars = {
-            "s_ce": self._get_historical_candles(self.short_ce_contract, start_of_day, current_dt),
-            "s_pe": self._get_historical_candles(self.short_pe_contract, start_of_day, current_dt),
-            "l_ce": self._get_historical_candles(self.long_ce_contract, start_of_day, current_dt),
-            "l_pe": self._get_historical_candles(self.long_pe_contract, start_of_day, current_dt),
-        }
-        time_module.sleep(0.5) # Pause after burst of API calls
+        # Create a temporary contract-like object for the index to pass to _get_historical_candles
+        index_contract = OptionContract(
+            symbol=self.index_name,
+            token=self.index_token,
+            exchange=self.index_exchange,
+            strike=0, option_type="", expiry=""  # Dummy values
+        )
 
-        if not all(hist_bars.values()):
-            log.error("event=VWAP_RECALC_FAIL | Failed to fetch bars for one or more legs. VWAP not updated.")
+        hist_bars = self._get_historical_candles(index_contract, start_of_day, current_dt)
+
+        if not hist_bars:
+            log.error("event=VWAP_RECALC_FAIL | Failed to fetch index bars. VWAP not updated.")
             return
 
-        # Reset accumulators
-        for key in self.individual_leg_vwap_accumulators:
-            self.individual_leg_vwap_accumulators[key] = {"cum_pv": 0.0, "cum_vol": 0.0}
+        # Reset accumulator
+        self.index_vwap_accumulator = {"cum_pv": 0.0, "cum_vol": 0.0}
 
-        # Repopulate accumulators with the full history
-        num_bars = len(hist_bars["s_ce"])
-        for i in range(num_bars):
-            for key, bars in hist_bars.items():
-                if i < len(bars):
-                    bar_data = bars[i]
-                    o, h, l, c, v = [float(x or 0) for x in bar_data[1:]]
-                    self.individual_leg_vwap_accumulators[key]["cum_pv"] += ((o + h + l + c) / 4) * v
-                    self.individual_leg_vwap_accumulators[key]["cum_vol"] += v
-        
-        log.info(f"event=VWAP_RECALC_SUCCESS | VWAP updated using {num_bars} bars.")
+        # Repopulate accumulator with the full history
+        for bar_data in hist_bars:
+            o, h, l, c, v = [float(x or 0) for x in bar_data[1:]]
+            # Using OHLC/4 for consistency with previous logic
+            self.index_vwap_accumulator["cum_pv"] += ((o + h + l + c) / 4) * v
+            self.index_vwap_accumulator["cum_vol"] += v
+
+        new_vwap = self._get_index_vwap()
+        log.info(f"event=VWAP_RECALC_SUCCESS | Index VWAP updated to {new_vwap:.2f} using {len(hist_bars)} bars.")
 
     def _check_and_resume_position(self):
         log.info("Checking for existing open positions...")
@@ -476,7 +487,7 @@ class IronCondorLive:
         return None
 
     def _execute_entry(self, current_net_credit: float, current_vwap: float):
-        log.info(f"event=ORDER_ENTRY_INIT | Triggered at NetCredit={current_net_credit:.2f}, VWAP={current_vwap:.2f}")
+        log.info(f"{Fore.CYAN}event=ORDER_ENTRY_INIT | Triggered at NetCredit={current_net_credit:.2f}, IndexVWAP={current_vwap:.2f}{Style.RESET_ALL}")
 
         if self.simulate_orders:
             log.warning("SIMULATION: Would have placed BUY orders for Long CE/PE and SELL orders for Short CE/PE.")
@@ -494,8 +505,8 @@ class IronCondorLive:
                     pass
 
             log.info(
-                f"event=ORDER_ENTRY_INIT | Triggered at NetCredit={current_net_credit:.2f}, VWAP={current_vwap:.2f} | "
-                f"Prices: S_CE={sim_sc_entry:.2f}, S_PE={sim_sp_entry:.2f}, L_CE={sim_lc_entry:.2f}, L_PE={sim_lp_entry:.2f}"
+                f"{Fore.CYAN}event=ORDER_ENTRY_INIT | Triggered at NetCredit={current_net_credit:.2f}, IndexVWAP={current_vwap:.2f} | "
+                f"Prices: S_CE={sim_sc_entry:.2f}, S_PE={sim_sp_entry:.2f}, L_CE={sim_lc_entry:.2f}, L_PE={sim_lp_entry:.2f}{Style.RESET_ALL}"
             )
 
             self.in_position = True
@@ -608,12 +619,12 @@ class IronCondorLive:
         if not all([s_ce_ltp, s_pe_ltp, l_ce_ltp, l_pe_ltp, nifty_ltp]): return
 
         net_credit = (s_ce_ltp + s_pe_ltp) - (l_ce_ltp + l_pe_ltp)
-        vwap = self._get_strategy_vwap()
+        index_vwap = self._get_index_vwap()
 
         if not self.in_position:
             log.info(f"reached here to take entry {self.in_position}")
             # Simplified Entry: Enter on the first valid tick after 9:30 AM if not already in a position.
-            self._execute_entry(net_credit, vwap)
+            self._execute_entry(net_credit, index_vwap)
         else:
             # --- Position Management ---
             entry_net_credit = (self.entry_info['short_ce_entry'] + self.entry_info['short_pe_entry']) - \
@@ -627,7 +638,7 @@ class IronCondorLive:
             nifty_str = f"{self.index_name}: {nifty_ltp:.2f} ({nifty_color}{nifty_change:+.2f}{Style.RESET_ALL})"
 
             pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-            log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f}, VWAP={vwap:.2f} | Open PNL: {open_pnl:+.2f}, Closed PNL: {self.closed_pnl:+.2f}, Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
+            log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f}, IndexVWAP={index_vwap:.2f} | Open PNL: {open_pnl:+.2f}, Closed PNL: {self.closed_pnl:.2f}, Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
 
             # --- CREDIT DECAY TAKE PROFIT (Primary TP) ---
             if self.credit_decay_tp_level > 0 and net_credit <= self.credit_decay_tp_level:
