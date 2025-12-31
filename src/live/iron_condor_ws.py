@@ -52,7 +52,6 @@ except Exception as e:
 class IronCondorLive:
     INDEX_CONFIG = {
         "NIFTY": {
-            "lot_size": 150,
             "token": "99926000",
             "exchange": "NSE",
             "options_exchange": "NFO",
@@ -63,7 +62,6 @@ class IronCondorLive:
         },
 
         "SENSEX": {
-            "lot_size": 60,
             "token": "99919000",
             "exchange": "BSE",
             "options_exchange": "BFO",
@@ -87,7 +85,6 @@ class IronCondorLive:
             raise ValueError(f"Invalid index '{self.index_name}'. Must be one of {list(self.INDEX_CONFIG.keys())}")
 
         config = self.INDEX_CONFIG[self.index_name]
-        self.lot_size = config["lot_size"]
         self.index_token = config["token"]
         self.index_exchange = config["exchange"]
         self.options_exchange = config["options_exchange"]
@@ -109,6 +106,7 @@ class IronCondorLive:
         self.long_ce_contract: OptionContract | None = None
         self.long_pe_contract: OptionContract | None = None
 
+        self.quantity = 0
         self.latest_ltp: Dict[str, float] = {}
         self.individual_leg_vwap_accumulators: Dict[str, Dict[str, float]] = {}
         self.next_vwap_update_time: dt_time | None = None
@@ -201,27 +199,28 @@ class IronCondorLive:
             params = yaml.safe_load(f)
         
         index_params = params.get(self.index_name, {})
-        self.take_profit_per_lot = index_params.get("take_profit_per_lot", 20.0)
-        self.absolute_stop_loss_per_lot = index_params.get("absolute_stop_loss_per_lot", 20.0)
+        self.lot_size = index_params.get("lot_size", 50)
+        self.num_lots = index_params.get("num_lots", 1)
+        self.quantity = self.lot_size * self.num_lots
+
+        self.take_profit_points = index_params.get("take_profit_points", 20.0)
+        self.absolute_stop_loss_points = index_params.get("absolute_stop_loss_points", 20.0)
         self.individual_leg_sl_multiplier = index_params.get("individual_leg_sl_multiplier", 2.25)
         self.spot_proximity_exit_points = index_params.get("spot_proximity_exit_points", 40)
 
         # Load trailing stop configuration
         self.trailing_stop_config = index_params.get("trailing_stop", {})
-        if self.trailing_stop_config.get("tiers"):
-            # Sort tiers descending by profit threshold to simplify lookup
-            self.trailing_stop_config["tiers"].sort(key=lambda x: x['pnl_above'], reverse=True)
 
         # Calculate activation MTM based on points
         activation_points = self.trailing_stop_config.get("activation_points", 6.0)
-        self.trailing_activation_mtm = activation_points * self.lot_size
+        self.trailing_activation_mtm = activation_points * self.quantity
 
-        self.take_profit_points = self.take_profit_per_lot * self.lot_size
-        self.absolute_stop_loss = self.absolute_stop_loss_per_lot * self.lot_size
+        self.take_profit_target = self.take_profit_points * self.quantity
+        self.absolute_stop_loss_target = self.absolute_stop_loss_points * self.quantity
         log.info(
             f"{Fore.CYAN}Loaded strategy params for {self.index_name}: "
-            f"TP={self.take_profit_points:.2f}, SL={self.absolute_stop_loss:.2f}, "
-            f"TrailingActivation={self.trailing_activation_mtm:.2f} ({activation_points} pts), "
+            f"Quantity={self.quantity} ({self.lot_size} lot size x {self.num_lots} lots), "
+            f"TP_Target={self.take_profit_target:.2f}, SL_Target={self.absolute_stop_loss_target:.2f}, "
             f"LegSLMultiplier={self.individual_leg_sl_multiplier}x{Style.RESET_ALL}"
         )
 
@@ -238,7 +237,8 @@ class IronCondorLive:
 
     def prepare_contracts(self):
         spot, spot_candle_end_time = get_index_first_15m_close(self.index_name, self.trading_date)
-        strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, self.index_name, trading_date=self.trading_date, strike_step=self.strike_step)
+        strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, self.index_name,
+                                                trading_date=self.trading_date, strike_step=self.strike_step, expiry_str=self.expiry)
         short_ce_strike, short_pe_strike, long_ce_strike, long_pe_strike = \
             strikes_info["ce_strike"], strikes_info["pe_strike"], strikes_info["long_ce_strike"], strikes_info["long_pe_strike"]
 
@@ -510,8 +510,8 @@ class IronCondorLive:
             return
         
         try:
-            lc_id = self.api.place_order(self.long_ce_contract.symbol, self.long_ce_contract.token, self.lot_size, "BUY")
-            lp_id = self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.lot_size, "BUY")
+            lc_id = self.api.place_order(self.long_ce_contract.symbol, self.long_ce_contract.token, self.quantity, "BUY")
+            lp_id = self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.quantity, "BUY")
         except Exception as e:
             log.error(f"Failed to place one or both BUY orders: {e}"); return
 
@@ -522,8 +522,8 @@ class IronCondorLive:
             log.error("One or both BUY orders failed to confirm. Aborting entry."); return
 
         try:
-            sc_id = self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.lot_size, "SELL")
-            sp_id = self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.lot_size, "SELL")
+            sc_id = self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.quantity, "SELL")
+            sp_id = self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.quantity, "SELL")
         except Exception as e:
             log.error(f"Failed to place one or both SELL orders: {e}. Exiting bought legs.")
             self._execute_exit(exit_reason="SELL_LEG_FAILED"); return
@@ -560,7 +560,7 @@ class IronCondorLive:
                                    (self.entry_info['long_ce_entry'] + self.entry_info['long_pe_entry'])
                 current_net_credit = (self.latest_ltp.get(self.short_ce_contract.token, 0) + self.latest_ltp.get(self.short_pe_contract.token, 0)) - \
                                      (self.latest_ltp.get(self.long_ce_contract.token, 0) + self.latest_ltp.get(self.long_pe_contract.token, 0))
-                simulated_open_pnl = (entry_net_credit - current_net_credit) * self.lot_size
+                simulated_open_pnl = (entry_net_credit - current_net_credit) * self.quantity
                 self.closed_pnl += simulated_open_pnl
             self.in_position = False
             self.trading_active = False # Stop trading for the day
@@ -569,10 +569,10 @@ class IronCondorLive:
             return
 
         # --- Real Order Placement ---
-        self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.lot_size, "BUY")
-        self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.lot_size, "BUY")
-        self.api.place_order(self.long_ce_contract.symbol, self.long_ce_contract.token, self.lot_size, "SELL")
-        self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.lot_size, "SELL")
+        self.api.place_order(self.short_ce_contract.symbol, self.short_ce_contract.token, self.quantity, "BUY")
+        self.api.place_order(self.short_pe_contract.symbol, self.short_pe_contract.token, self.quantity, "BUY")
+        self.api.place_order(self.long_ce_contract.symbol, self.long_ce_contract.token, self.quantity, "SELL")
+        self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.quantity, "SELL")
         
         self.in_position = False
         self.trading_active = False # Stop trading for the day
@@ -619,7 +619,7 @@ class IronCondorLive:
             entry_net_credit = (self.entry_info['short_ce_entry'] + self.entry_info['short_pe_entry']) - \
                                (self.entry_info['long_ce_entry'] + self.entry_info['long_pe_entry'])
             
-            open_pnl = (entry_net_credit - net_credit) * self.lot_size
+            open_pnl = (entry_net_credit - net_credit) * self.quantity
             total_pnl = open_pnl + self.closed_pnl
             
             nifty_change = nifty_ltp - self.entry_info.get("nifty_entry_price", nifty_ltp)
@@ -634,9 +634,9 @@ class IronCondorLive:
                 log.info(f"{Fore.GREEN}Credit Decay TP hit. Current Credit: {net_credit:.2f} <= Target: {self.credit_decay_tp_level:.2f}{Style.RESET_ALL}")
                 self._execute_exit(exit_reason="CREDIT_DECAY_TP")
                 return  # Exit immediately
-            if total_pnl >= self.take_profit_points:
+            if total_pnl >= self.take_profit_target:
                 self._execute_exit(exit_reason="TAKE_PROFIT")
-            elif total_pnl <= -self.absolute_stop_loss:
+            elif total_pnl <= -self.absolute_stop_loss_target:
                 self._execute_exit(exit_reason="STOP_LOSS_ABS")
             # New condition: Spot price near short strikes
             elif nifty_ltp <= (self.short_pe_contract.strike + self.spot_proximity_exit_points) or \
@@ -662,16 +662,16 @@ class IronCondorLive:
                     total_reduction_points = hours_to_reduce_for * reduction_per_hour
 
                     # Get current activation points to reduce from
-                    current_activation_points = self.trailing_activation_mtm / self.lot_size
+                    current_activation_points = self.trailing_activation_mtm / self.quantity
                     new_activation_points = max(min_activation_points, current_activation_points - total_reduction_points)
 
                     # Update the MTM threshold
-                    self.trailing_activation_mtm = new_activation_points * self.lot_size
+                    self.trailing_activation_mtm = new_activation_points * self.quantity
 
                     # Calculate what the SL would be at this new level for logging
                     reversal_pct_at_new_level = self._get_trailing_reversal_pct(self.trailing_activation_mtm)
                     sl_trigger_value = self.trailing_activation_mtm * reversal_pct_at_new_level
-                    sl_trigger_points = sl_trigger_value / self.lot_size
+                    sl_trigger_points = sl_trigger_value / self.quantity
 
                     log.warning(f"{Fore.YELLOW}Time in trade > {hours_passed}hr. Trailing Activation reduced to: {self.trailing_activation_mtm:,.2f} ({new_activation_points:.2f} pts). "
                                 f"New SL trigger at ~{sl_trigger_points:.2f} pts ({reversal_pct_at_new_level*100:.0f}%){Style.RESET_ALL}")
@@ -686,7 +686,7 @@ class IronCondorLive:
             if self.trailing_sl_active:
                 new_peak_mtm = max(self.peak_mtm, total_pnl)
                 if new_peak_mtm > self.peak_mtm:
-                    peak_mtm_points = new_peak_mtm / self.lot_size
+                    peak_mtm_points = new_peak_mtm / self.quantity
                     log.info(f"{Fore.MAGENTA}Peak MTM updated: Abs={new_peak_mtm:.2f} | Pts={peak_mtm_points:.2f}{Style.RESET_ALL}")
                     self.peak_mtm = new_peak_mtm
 

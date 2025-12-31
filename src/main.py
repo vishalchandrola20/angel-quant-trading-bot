@@ -6,7 +6,7 @@ from datetime import datetime, time # Import time from datetime
 from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
 from src.strategy.strike_selection import get_single_ce_pe_strikes
 from src.api.smartapi_client import AngelAPI # Import AngelAPI
-from src.market.contracts import find_option # Import find_option
+from src.market.contracts import find_option, load_scrip_master # Import find_option and load_scrip_master
 
 
 from src.backtest.vwap_ce_pe_strategy import run_iron_condor_strategy_for_day, run_vwap_strangle_strategy_for_day
@@ -35,6 +35,7 @@ def main():
             "backtest_vwap_straddle",
             "backtest_iron_condor",
             "calculate_vwap_until", # New task
+            "update_scrip_master",
         ],
         default="option_chain",
     )
@@ -185,6 +186,11 @@ def main():
         print(f"Final OHLC4 VWAP at {args.time}: {ohlc4_vwap:.2f}")
         print(f"Final Close VWAP at {args.time}: {close_vwap:.2f}")
         print(f"Final HLC3 VWAP at {args.time}: {hlc3_vwap:.2f}")
+
+    elif args.task == "update_scrip_master":
+        print("Forcing download of latest Scrip Master from Angel One...")
+        load_scrip_master(force_download=True)
+        print("Scrip Master updated successfully.")
 
 
 if __name__ == "__main__":
