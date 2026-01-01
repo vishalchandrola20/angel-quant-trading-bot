@@ -247,6 +247,20 @@ class IronCondorLive:
         self.long_ce_contract = find_option(self.index_name, long_ce_strike, "CE", self.expiry, self.trading_date)
         self.long_pe_contract = find_option(self.index_name, long_pe_strike, "PE", self.expiry, self.trading_date)
         
+        # Calculate distances for logging
+        ce_dist = short_ce_strike - spot
+        pe_dist = spot - short_pe_strike
+        hedge_ce_dist = long_ce_strike - spot
+        hedge_pe_dist = spot - long_pe_strike
+
+        log.info(
+            f"{Fore.YELLOW}Final Selected Strikes (Spot: {spot:.2f}): "
+            f"Short CE {short_ce_strike} ({ce_dist:.2f} pts), "
+            f"Short PE {short_pe_strike} ({pe_dist:.2f} pts) | "
+            f"Hedge CE {long_ce_strike} ({hedge_ce_dist:.2f} pts), "
+            f"Hedge PE {long_pe_strike} ({hedge_pe_dist:.2f} pts){Style.RESET_ALL}"
+        )
+
         # Initial VWAP calculation will be triggered on the first tick after 9:30
         log.info("Contracts prepared. VWAP will be calculated on the first tick after 9:30 AM.")
 
@@ -627,7 +641,7 @@ class IronCondorLive:
             nifty_str = f"{self.index_name}: {nifty_ltp:.2f} ({nifty_color}{nifty_change:+.2f}{Style.RESET_ALL})"
 
             pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-            log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f}, VWAP={vwap:.2f} | Open PNL: {open_pnl:+.2f}, Closed PNL: {self.closed_pnl:+.2f}, Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
+            log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f}, VWAP={vwap:.2f} | Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
 
             # --- CREDIT DECAY TAKE PROFIT (Primary TP) ---
             if self.credit_decay_tp_level > 0 and net_credit <= self.credit_decay_tp_level:
