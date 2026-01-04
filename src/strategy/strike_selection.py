@@ -110,49 +110,63 @@ def _adjust_for_price_difference(
     expiry_str: str | None
 ) -> tuple[int, int]:
     """Adjusts strikes based on the price difference of the initial options."""
-    ce_contract = find_option(index_name, ce_strike, "CE", expiry_str, trading_date)
-    pe_contract = find_option(index_name, pe_strike, "PE", expiry_str, trading_date)
+    strike_step = 100 if index_name.upper() == "SENSEX" else 50
 
-    ce_ltp = get_historical_price(ce_contract)
-    pe_ltp = get_historical_price(pe_contract)
+    for i in range(2):
+        ce_contract = find_option(index_name, ce_strike, "CE", expiry_str, trading_date)
+        pe_contract = find_option(index_name, pe_strike, "PE", expiry_str, trading_date)
 
-    log.info(f"{Fore.YELLOW}Prices for adjustment check: CE Strike={ce_contract.strike}, Price={ce_ltp:.2f} | PE Strike={pe_contract.strike}, Price={pe_ltp:.2f}{Style.RESET_ALL}")
+        ce_ltp = get_historical_price(ce_contract)
+        pe_ltp = get_historical_price(pe_contract)
 
-    price_diff_pct = abs(ce_ltp - pe_ltp) / max(ce_ltp, pe_ltp)
+        if ce_ltp is None or pe_ltp is None:
+            log.warning(f"{Fore.RED}Skipping price adjustment: Could not fetch prices (CE={ce_ltp}, PE={pe_ltp}){Style.RESET_ALL}")
+            return ce_strike, pe_strike
 
-    if price_diff_pct > 0.25:
-        strike_step = 100 if index_name.upper() == "SENSEX" else 50
-        log.warning(f"{Fore.YELLOW}Price difference > 30% ({price_diff_pct:.1%}). Adjusting cheaper leg.{Style.RESET_ALL}")
-        if ce_ltp < pe_ltp:
-            ce_strike -= strike_step
-            new_ce_contract = find_option(index_name, ce_strike, "CE", expiry_str, trading_date)
-            new_ce_price = get_historical_price(new_ce_contract)
-            new_price_diff_pct = abs(new_ce_price - pe_ltp) / max(new_ce_price, pe_ltp)
-            log.info(f"{Fore.CYAN}CE is cheaper. New CE strike: {ce_strike} with Price={new_ce_price:.2f}. New diff: {new_price_diff_pct:.1%}{Style.RESET_ALL}")
+        log.info(f"{Fore.YELLOW}Prices for adjustment check (Iter {i+1}): CE {ce_strike}={ce_ltp:.2f} | PE {pe_strike}={pe_ltp:.2f}{Style.RESET_ALL}")
 
-            if new_price_diff_pct > 0.25:
-                log.warning(f"{Fore.YELLOW}Difference still > 30%. Adjusting expensive leg (PE) away.{Style.RESET_ALL}")
-                pe_strike -= strike_step
-                final_pe_contract = find_option(index_name, pe_strike, "PE", expiry_str, trading_date)
-                final_pe_price = get_historical_price(final_pe_contract)
-                final_diff_pct = abs(new_ce_price - final_pe_price) / max(new_ce_price, final_pe_price)
-                log.info(f"{Fore.CYAN}PE moved away. New PE strike: {pe_strike} with Price={final_pe_price:.2f}. Final diff: {final_diff_pct:.1%}{Style.RESET_ALL}")
+        price_diff_pct = abs(ce_ltp - pe_ltp) / max(ce_ltp, pe_ltp)
+
+        if price_diff_pct <= 0.15:
+            log.info(f"{Fore.GREEN}Price difference {price_diff_pct:.1%} is within 15% limit.{Style.RESET_ALL}")
+            break
+        
+        log.warning(f"{Fore.YELLOW}Price difference {price_diff_pct:.1%} > 15%. Adjusting...{Style.RESET_ALL}")
+
+        if ce_ltp > pe_ltp:
+            # CE is expensive. Move CE AWAY (Higher Strike).
+            log.info(f"CE is expensive ({ce_ltp:.2f} > {pe_ltp:.2f}). Moving CE AWAY (Strike +{strike_step}).")
+            ce_strike += strike_step
+            
+            # Check intermediate diff
+            temp_ce_contract = find_option(index_name, ce_strike, "CE", expiry_str, trading_date)
+            temp_ce_ltp = get_historical_price(temp_ce_contract)
+            if temp_ce_ltp is None: break
+            
+            new_diff = abs(temp_ce_ltp - pe_ltp) / max(temp_ce_ltp, pe_ltp)
+            if new_diff > 0.15:
+                log.warning(f"Diff still {new_diff:.1%} > 15%. Moving PE (Cheaper) CLOSER (Strike +{strike_step}).")
+                pe_strike += strike_step # PE Closer = Higher Strike
+            else:
+                log.info(f"Adjustment successful after moving CE. New diff {new_diff:.1%}.")
+                break
         else:
-            pe_strike += strike_step
-            new_pe_contract = find_option(index_name, pe_strike, "PE", expiry_str, trading_date)
-            new_pe_price = get_historical_price(new_pe_contract)
-            new_price_diff_pct = abs(ce_ltp - new_pe_price) / max(ce_ltp, new_pe_price)
-            log.info(f"{Fore.CYAN}PE is cheaper. New PE strike: {pe_strike} with Price={new_pe_price:.2f}. New diff: {new_price_diff_pct:.1%}{Style.RESET_ALL}")
-
-            if new_price_diff_pct > 0.25:
-                log.warning(f"{Fore.YELLOW}Difference still > 30%. Adjusting expensive leg (CE) away.{Style.RESET_ALL}")
-                ce_strike += strike_step
-                final_ce_contract = find_option(index_name, ce_strike, "CE", expiry_str, trading_date)
-                final_ce_price = get_historical_price(final_ce_contract)
-                final_diff_pct = abs(final_ce_price - new_pe_price) / max(final_ce_price, new_pe_price)
-                log.info(f"{Fore.CYAN}CE moved away. New CE strike: {ce_strike} with Price={final_ce_price:.2f}. Final diff: {final_diff_pct:.1%}{Style.RESET_ALL}")
-    else:
-        log.info(f"{Fore.GREEN}Price difference is within limits. No adjustment needed.{Style.RESET_ALL}")
+            # PE is expensive. Move PE AWAY (Lower Strike).
+            log.info(f"PE is expensive ({pe_ltp:.2f} > {ce_ltp:.2f}). Moving PE AWAY (Strike -{strike_step}).")
+            pe_strike -= strike_step
+            
+            # Check intermediate diff
+            temp_pe_contract = find_option(index_name, pe_strike, "PE", expiry_str, trading_date)
+            temp_pe_ltp = get_historical_price(temp_pe_contract)
+            if temp_pe_ltp is None: break
+            
+            new_diff = abs(ce_ltp - temp_pe_ltp) / max(ce_ltp, temp_pe_ltp)
+            if new_diff > 0.15:
+                log.warning(f"Diff still {new_diff:.1%} > 15%. Moving CE (Cheaper) CLOSER (Strike -{strike_step}).")
+                ce_strike -= strike_step # CE Closer = Lower Strike
+            else:
+                log.info(f"Adjustment successful after moving PE. New diff {new_diff:.1%}.")
+                break
     
     return ce_strike, pe_strike
 
@@ -192,13 +206,13 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
         dte = _get_trading_days_to_expiry(trading_date, expiry_date)
 
         if dte <= 1:  # 0 and 1 DTE (e.g., Tuesday, Monday for a Tuesday expiry)
-            strike_offset = 200
+            strike_offset = 300
             hedge_offset = 400
         elif dte <= 3:  # 2 and 3 DTE (e.g., Friday, Thursday)
-            strike_offset = 350
+            strike_offset = 400
             hedge_offset = 400
         else:  # 4+ DTE
-            strike_offset = 400
+            strike_offset = 500
             hedge_offset = 400
         log.info(f"NIFTY expiry is in {dte} trading days. Selected strike offset: {strike_offset}, hedge offset: {hedge_offset}")
 
@@ -249,18 +263,18 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
         # Determine min_net_credit based on DTE
         if index_name.upper() == "SENSEX":
             if dte <= 1: min_net_credit = 50
-            elif dte <= 3: min_net_credit = 75
+            elif dte <= 4: min_net_credit = 75
             else: min_net_credit = 90
         else: # NIFTY
             if dte <= 1: min_net_credit = 20
-            elif dte <= 3: min_net_credit = 30
-            else: min_net_credit = 30
+            elif dte <= 4: min_net_credit = 30
+            else: min_net_credit = 35
 
         log.info(f"DTE is {dte}. Minimum required net credit set to: {min_net_credit}")
 
         # --- Net Credit-based Adjustment ---
         min_strike_distance = 900 if index_name.upper() == "SENSEX" else 200
-        max_adjust_loops = 5  # Safety break to prevent infinite loops
+        max_adjust_loops = 10  # Safety break to prevent infinite loops (increased for single-leg adjustment)
         
         # Initialize final long strikes with default values
         final_long_ce_strike = ce_strike + hedge_offset
@@ -274,6 +288,10 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             # Get historical prices for the current strikes
             ce_price = get_historical_price(temp_ce_contract)
             pe_price = get_historical_price(temp_pe_contract)
+
+            if ce_price is None or pe_price is None:
+                log.warning(f"{Fore.RED}Cannot perform credit check: Price missing (CE={ce_price}, PE={pe_price}){Style.RESET_ALL}")
+                break
 
             # --- Hedge Leg Liquidity Search ---
             # For Long CE
@@ -317,18 +335,32 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
                 log.info(f"{Fore.GREEN}Net credit {current_net_credit:.2f} is >= minimum required {min_net_credit}. Strikes finalized for now.{Style.RESET_ALL}")
                 break  # Exit loop if credit is sufficient
             else:
-                log.warning(f"Net credit {current_net_credit:.2f} is below minimum {min_net_credit}. Adjusting strikes closer.")
+                log.warning(f"Net credit {current_net_credit:.2f} is below minimum {min_net_credit}. Adjusting cheaper leg closer.")
 
-                # Check if the next adjustment would violate the minimum strike distance
-                next_ce_strike = ce_strike - strike_step
-                next_pe_strike = pe_strike + strike_step
+                # Determine which leg is cheaper
+                adjust_ce = ce_price < pe_price
+                adjusted = False
 
-                if (next_ce_strike - ce_base) < min_strike_distance or (pe_base - next_pe_strike) < min_strike_distance:
-                    log.error(f"{Fore.RED}Cannot adjust further to meet min credit. Next adjustment would breach min strike distance of {min_strike_distance} points.{Style.RESET_ALL}")
-                    break  # Stop adjusting
-
-                ce_strike = next_ce_strike
-                pe_strike = next_pe_strike
+                # Try adjusting CE if it's cheaper
+                if adjust_ce:
+                    next_ce_strike = ce_strike - strike_step
+                    if (next_ce_strike - ce_base) >= min_strike_distance:
+                        ce_strike = next_ce_strike
+                        log.info(f"Adjusting CE (Cheaper: {ce_price:.2f} < {pe_price:.2f}) -> New CE Strike: {ce_strike}")
+                        adjusted = True
+                    else:
+                        log.warning(f"Cannot adjust CE further (Limit {min_strike_distance}). Trying PE.")
+                
+                # If CE wasn't adjusted (either PE was cheaper OR CE hit limit), try PE
+                if not adjusted:
+                    next_pe_strike = pe_strike + strike_step
+                    if (pe_base - next_pe_strike) >= min_strike_distance:
+                        pe_strike = next_pe_strike
+                        log.info(f"Adjusting PE (Cheaper/Fallback) -> New PE Strike: {pe_strike}")
+                        adjusted = True
+                    else:
+                        log.error(f"{Fore.RED}Cannot adjust further. Both legs reached min strike distance limit.{Style.RESET_ALL}")
+                        break
         else: # This 'else' belongs to the 'for' loop, runs if the loop completes without a 'break'
             log.error(f"Could not achieve minimum net credit of {min_net_credit} after {max_adjust_loops} attempts. Using last calculated strikes.")
 

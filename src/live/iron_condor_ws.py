@@ -20,9 +20,9 @@ from collections import defaultdict
 from colorama import Fore, Style, init as colorama_init
 
 from src.api.smartapi_client import AngelAPI
-from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
 from src.market.contracts import find_option, OptionContract
 from src.strategy.strike_selection import get_single_ce_pe_strikes
+from src.data_pipeline.market_data import get_latest_candle_close
 
 # Initialize colorama
 colorama_init(autoreset=True)
@@ -80,6 +80,7 @@ class IronCondorLive:
             vwap_recalc_interval_minutes: int = 5,
             simulate_orders: bool = True,
     ):
+        self.state_file = None
         self.index_name = index_name.upper()
         if self.index_name not in self.INDEX_CONFIG:
             raise ValueError(f"Invalid index '{self.index_name}'. Must be one of {list(self.INDEX_CONFIG.keys())}")
@@ -122,13 +123,13 @@ class IronCondorLive:
 
         # Initialize all state variables
         self._reset_state()
-        
+
         # Load dynamic strategy parameters from YAML
         self.params_file_path = "config/strategy_params.yaml"
         self.last_params_mtime = 0
         self._load_strategy_params()
 
-        
+
     def _ensure_csv(self):
         self.closed_pnl = 0.0
         if not self.csv_path.exists():
@@ -197,7 +198,7 @@ class IronCondorLive:
         """Loads strategy parameters from the YAML file."""
         with open(self.params_file_path, 'r') as f:
             params = yaml.safe_load(f)
-        
+
         index_params = params.get(self.index_name, {})
         self.lot_size = index_params.get("lot_size", 50)
         self.num_lots = index_params.get("num_lots", 1)
@@ -236,11 +237,51 @@ class IronCondorLive:
             log.error(f"Could not reload strategy params: {e}")
 
     def prepare_contracts(self):
-        spot, spot_candle_end_time = get_index_first_15m_close(self.index_name, self.trading_date)
-        strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, self.index_name,
-                                                trading_date=self.trading_date, strike_step=self.strike_step, expiry_str=self.expiry)
-        short_ce_strike, short_pe_strike, long_ce_strike, long_pe_strike = \
-            strikes_info["ce_strike"], strikes_info["pe_strike"], strikes_info["long_ce_strike"], strikes_info["long_pe_strike"]
+        self.state_file = self.events_dir / f"state_{self.index_name}_{self.trading_date}.json"
+        strikes_data = {}
+
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    strikes_data = json.load(f)
+                log.info(f"{Fore.CYAN}Recovered strikes from state file: {self.state_file}{Style.RESET_ALL}")
+            except Exception as e:
+                log.error(f"Failed to load state file: {e}")
+
+        if not strikes_data:
+            # If running after market hours (e.g. testing), use 9:40 AM for option price fetching
+            now = datetime.now()
+            if now.time() > dt_time(15, 30):
+                calc_time = datetime.combine(self.trading_date, dt_time(9, 45))
+                log.warning(f"After market hours detected. Using {calc_time} for strike selection logic.")
+            else:
+                calc_time = now
+
+            spot = get_latest_candle_close(self.api, self.index_exchange, self.index_token, self.index_name, query_time=calc_time)
+
+            strikes_info = get_single_ce_pe_strikes(
+                spot, calc_time, self.index_name,
+                trading_date=self.trading_date, strike_step=self.strike_step, expiry_str=self.expiry
+            )
+            strikes_data = {
+                "short_ce": strikes_info["ce_strike"],
+                "short_pe": strikes_info["pe_strike"],
+                "long_ce": strikes_info["long_ce_strike"],
+                "long_pe": strikes_info["long_pe_strike"],
+                "spot_ref": spot
+            }
+            try:
+                with open(self.state_file, 'w') as f:
+                    json.dump(strikes_data, f, indent=4)
+                log.info(f"Saved strikes to state file: {self.state_file}")
+            except Exception as e:
+                log.error(f"Failed to write state file: {e}")
+
+        short_ce_strike = strikes_data["short_ce"]
+        short_pe_strike = strikes_data["short_pe"]
+        long_ce_strike = strikes_data["long_ce"]
+        long_pe_strike = strikes_data["long_pe"]
+        spot = strikes_data.get("spot_ref", 0)
 
         self.short_ce_contract = find_option(self.index_name, short_ce_strike, "CE", self.expiry, self.trading_date)
         self.short_pe_contract = find_option(self.index_name, short_pe_strike, "PE", self.expiry, self.trading_date)
@@ -262,7 +303,8 @@ class IronCondorLive:
         )
 
         # Initial VWAP calculation will be triggered on the first tick after 9:30
-        log.info("Contracts prepared. VWAP will be calculated on the first tick after 9:30 AM.")
+        start_msg = "immediately" if self.simulate_orders else "after 9:40 AM"
+        log.info(f"Contracts prepared. Trading starts {start_msg}.")
 
     def _get_strategy_vwap(self) -> float:
         """Calculates the combined strategy VWAP from individual leg VWAPs."""
@@ -606,7 +648,11 @@ class IronCondorLive:
             self._execute_exit(exit_reason="EOD"); return
 
         current_time = now.time()
-        if current_time < dt_time(9, 30): return
+        
+        # Live trading starts at 9:40, Simulation runs anytime
+        if not self.simulate_orders and current_time < dt_time(9, 40):
+            return
+
         # --- Periodic VWAP Recalculation ---
         if self.next_vwap_update_time is None or current_time >= self.next_vwap_update_time:
             self._recalculate_vwap_from_history(now)
