@@ -7,6 +7,7 @@ from src.data_pipeline.nifty_first_15m import get_index_first_15m_close
 from src.strategy.strike_selection import get_single_ce_pe_strikes
 from src.api.smartapi_client import AngelAPI # Import AngelAPI
 from src.market.contracts import find_option, load_scrip_master # Import find_option and load_scrip_master
+from src.data_pipeline.upstox_option_chain import fetch_and_save_upstox_chain
 
 
 from src.backtest.vwap_ce_pe_strategy import run_iron_condor_strategy_for_day, run_vwap_strangle_strategy_for_day
@@ -36,6 +37,7 @@ def main():
             "backtest_iron_condor",
             "calculate_vwap_until", # New task
             "update_scrip_master",
+            "fetch_upstox_option_chain",
         ],
         default="option_chain",
     )
@@ -191,6 +193,14 @@ def main():
         print("Forcing download of latest Scrip Master from Angel One...")
         load_scrip_master(force_download=True)
         print("Scrip Master updated successfully.")
+
+    elif args.task == "fetch_upstox_option_chain":
+        if not args.date:
+            raise SystemExit("--date is required for fetch_upstox_option_chain (to be used as expiry date in YYYY-MM-DD format)")
+        
+        # For this task, we'll use the --date argument as the expiry date
+        expiry_date_str = args.date
+        fetch_and_save_upstox_chain(index_name=args.index, expiry_date=expiry_date_str)
 
 
 if __name__ == "__main__":
