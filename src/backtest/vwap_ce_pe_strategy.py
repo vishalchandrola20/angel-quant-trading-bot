@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 
 INDEX_CONFIG = {
     "NIFTY": {
-        "lot_size": 150,
+        "lot_size": 130,
         "token": "99926000",
         "exchange": "NSE",
         "options_exchange": "NFO",
@@ -28,7 +28,7 @@ INDEX_CONFIG = {
         "strike_step": 50,
         "spot_proximity_exit_points": 40,
         "take_profit_per_lot": 20.0,
-        "absolute_stop_loss_per_lot": 6.0,
+        "absolute_stop_loss_per_lot": 8.0,
         "trailing_activation_mtm_per_lot": 8.0, # 1000 / 50 lots
         "trailing_sl_reversal_pct": 0.70,
     },
@@ -43,7 +43,7 @@ INDEX_CONFIG = {
         "strike_step": 100,
         "spot_proximity_exit_points": 60,
         "take_profit_per_lot": 50.0,
-        "absolute_stop_loss_per_lot": 20.0,
+        "absolute_stop_loss_per_lot": 15.0,
         "trailing_activation_mtm_per_lot": 20, # 1000 / 60 lots
         "trailing_sl_reversal_pct": 0.70,
     }
@@ -126,7 +126,7 @@ def _fetch_intraday_bars_for_iron_condor(
     strike_step = config["strike_step"]
 
     spot, spot_candle_end_time = get_index_first_15m_close(index_name, trading_date)
-    strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, index_name=index_name, trading_date=trading_date, strike_step=strike_step)
+    strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, index_name=index_name, trading_date=trading_date, strike_step=strike_step, expiry_str=expiry_str)
     short_ce_strike, short_pe_strike, long_ce_strike, long_pe_strike = \
         strikes_info["ce_strike"], strikes_info["pe_strike"], strikes_info["long_ce_strike"], strikes_info["long_pe_strike"]
 
@@ -217,7 +217,7 @@ def run_iron_condor_strategy_for_day(
         current_reason = ""
         pnl = 0.0
 
-        if bar_time >= time(9, 30):
+        if bar_time >= time(9, 45):
             if not in_position and exit_index is None:
                 # Simplified entry: enter on the first valid bar (9:30)
                 if entry_index is None:
@@ -235,7 +235,7 @@ def run_iron_condor_strategy_for_day(
                         f"Long CE={bar.long_ce_close:.2f}, Long PE={bar.long_pe_close:.2f}"
                     )
             
-            if in_position and bar_time >= time(9, 31):
+            if in_position and bar_time >= time(9, 46):
                 entry_net_credit = entry_bar.net_credit_close
 
                 # Calculate PNL based on the high and low of the net credit to get a true picture of the bar's range
@@ -359,8 +359,8 @@ def _fetch_intraday_bars_for_ce_pe(
         bar_interval: str = "FIVE_MINUTE",
         expiry_str: str | None = None,
 ) -> tuple[list[StrangleBar], str, str]:
-    spot, _ = get_index_first_15m_close("NIFTY", trading_date)
-    strikes_info = get_single_ce_pe_strikes(spot, _, index_name="NIFTY")
+    spot, spot_candle_end_time = get_index_first_15m_close("NIFTY", trading_date)
+    strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, index_name="NIFTY", expiry_str=expiry_str, trading_date=trading_date)
     ce_strike, pe_strike = strikes_info["ce_strike"], strikes_info["pe_strike"]
 
     log.info(f"Backtest date={trading_date}")

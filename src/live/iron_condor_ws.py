@@ -155,9 +155,13 @@ class IronCondorLive:
         self.last_reversal_pct = 0.0
         self.last_activation_reduction_hour = 0
         self.credit_decay_tp_level = 0.0
+        self.spot_ref = 0.0
 
         self.events_dir = Path("data/live")
         self.events_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir = Path("data/state")
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
         self.csv_path = self.events_dir / f"iron_condor_events_{self.trading_date}.csv"
         self._ensure_csv()
 
@@ -236,15 +240,38 @@ class IronCondorLive:
         except Exception as e:
             log.error(f"Could not reload strategy params: {e}")
 
+    def _save_strategy_state(self):
+        """Saves the current strategy state to the JSON file."""
+        if not self.state_file:
+            mode_str = "live" if not self.simulate_orders else "sim"
+            self.state_file = self.state_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
+
+        data = {
+            "in_position": self.in_position,
+            "entry_info": self.entry_info,
+            "quantity": self.quantity,
+            # Save contract strikes for easier reconstruction in sim mode
+            "short_ce_strike": self.short_ce_contract.strike if self.short_ce_contract else None,
+            "short_pe_strike": self.short_pe_contract.strike if self.short_pe_contract else None,
+            "long_ce_strike": self.long_ce_contract.strike if self.long_ce_contract else None,
+            "long_pe_strike": self.long_pe_contract.strike if self.long_pe_contract else None,
+        }
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            log.error(f"Failed to save strategy state: {e}")
+
     def prepare_contracts(self):
-        self.state_file = self.events_dir / f"state_{self.index_name}_{self.trading_date}.json"
+        mode_str = "live" if not self.simulate_orders else "sim"
+        self.state_file = self.state_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
         strikes_data = {}
 
         if self.state_file.exists():
             try:
                 with open(self.state_file, 'r') as f:
                     strikes_data = json.load(f)
-                log.info(f"{Fore.CYAN}Recovered strikes from state file: {self.state_file}{Style.RESET_ALL}")
+                log.info(f"{Fore.CYAN}Recovered strikes from state file for {mode_str.upper()} mode: {self.state_file}{Style.RESET_ALL}")
             except Exception as e:
                 log.error(f"Failed to load state file: {e}")
 
@@ -258,6 +285,7 @@ class IronCondorLive:
                 calc_time = now
 
             spot = get_latest_candle_close(self.api, self.index_exchange, self.index_token, self.index_name, query_time=calc_time)
+            self.spot_ref = spot
 
             strikes_info = get_single_ce_pe_strikes(
                 spot, calc_time, self.index_name,
@@ -270,18 +298,14 @@ class IronCondorLive:
                 "long_pe": strikes_info["long_pe_strike"],
                 "spot_ref": spot
             }
-            try:
-                with open(self.state_file, 'w') as f:
-                    json.dump(strikes_data, f, indent=4)
-                log.info(f"Saved strikes to state file: {self.state_file}")
-            except Exception as e:
-                log.error(f"Failed to write state file: {e}")
+            # State is now saved in _execute_entry after prices are confirmed
 
         short_ce_strike = strikes_data["short_ce"]
         short_pe_strike = strikes_data["short_pe"]
         long_ce_strike = strikes_data["long_ce"]
         long_pe_strike = strikes_data["long_pe"]
         spot = strikes_data.get("spot_ref", 0)
+        self.spot_ref = spot
 
         self.short_ce_contract = find_option(self.index_name, short_ce_strike, "CE", self.expiry, self.trading_date)
         self.short_pe_contract = find_option(self.index_name, short_pe_strike, "PE", self.expiry, self.trading_date)
@@ -411,88 +435,118 @@ class IronCondorLive:
         
         log.info(f"event=VWAP_RECALC_SUCCESS | VWAP updated using {num_bars} bars.")
 
-    def _check_and_resume_position(self):
-        log.info("Checking for existing open positions...")
-        # In simulation mode, we never look at the real trade book. PNL starts at 0.
+    def _check_and_resume_position(self) -> bool:
+        log.info("Checking for existing position state to resume...")
+        mode_str = "live" if not self.simulate_orders else "sim"
+        self.state_file = self.state_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
+
+        if not self.state_file.exists():
+            log.info(f"No state file found at {self.state_file}. Starting fresh.")
+            return False
+
+        try:
+            with open(self.state_file, 'r') as f:
+                state_data = json.load(f)
+        except Exception as e:
+            log.error(f"Failed to load state file: {e}")
+            return False
+
+        if not state_data.get("in_position"):
+            log.info("State file indicates no active position. Starting fresh.")
+            return False
+
+        # --- A position was active, let's try to resume it ---
+        self.entry_info = state_data.get("entry_info", {})
+        if not self.entry_info:
+            log.error("State file shows active position but entry_info is missing. Cannot resume.")
+            return False
+
+        # Reconstruct contracts from saved strikes
+        short_ce_strike = state_data.get("short_ce_strike")
+        short_pe_strike = state_data.get("short_pe_strike")
+        long_ce_strike = state_data.get("long_ce_strike")
+        long_pe_strike = state_data.get("long_pe_strike")
+
+        if not all([short_ce_strike, short_pe_strike, long_ce_strike, long_pe_strike]):
+            log.error("State file is missing one or more contract strikes. Cannot resume.")
+            return False
+
+        self.short_ce_contract = find_option(self.index_name, short_ce_strike, "CE", self.expiry, self.trading_date)
+        self.short_pe_contract = find_option(self.index_name, short_pe_strike, "PE", self.expiry, self.trading_date)
+        self.long_ce_contract = find_option(self.index_name, long_ce_strike, "CE", self.expiry, self.trading_date)
+        self.long_pe_contract = find_option(self.index_name, long_pe_strike, "PE", self.expiry, self.trading_date)
+
+        # In live mode, we must verify against the broker's actual positions
         if not self.simulate_orders:
-            self.closed_pnl = self._calculate_closed_pnl()
-            log.info(f"Found initial closed PNL from trade book: {self.closed_pnl:.2f}")
-
-        open_positions = self.api.get_open_positions()
-        if not open_positions:
-            log.info("No open positions found.")
-            return
-
-        s_ce, s_pe, l_ce, l_pe = None, None, None, None
-        for pos in open_positions:
-            symbol = pos.get("tradingsymbol")
-            log.info(f"Checking position: {symbol}, sellqty: {pos.get('sellqty')}, buyqty: {pos.get('buyqty')}")
-            if int(pos.get('sellqty', 0)) > int(pos.get('buyqty', 0)): # Net short
-                if symbol == self.short_ce_contract.symbol: s_ce = pos
-                elif symbol == self.short_pe_contract.symbol: s_pe = pos
-            elif int(pos.get('buyqty', 0)) > int(pos.get('sellqty', 0)): # Net long
-                if symbol == self.long_ce_contract.symbol: l_ce = pos
-                elif symbol == self.long_pe_contract.symbol: l_pe = pos
-        
-        if all([s_ce, s_pe, l_ce, l_pe]):
-            log.warning("event=RESUME_POSITION | Found existing open Iron Condor. Resuming management.")
-            self.in_position = True
-            
-            # Fetch current index price to use as reference for PNL change display
-            try:
-                index_ltp = self.api.get_ltp(self.index_exchange, self.index_name, self.index_token)
-                self.latest_ltp[self.index_token] = index_ltp
-            except Exception as e:
-                log.error(f"Failed to fetch index LTP during resume: {e}")
-                index_ltp = 0.0
-
-            self.entry_info = {
-                "ts": datetime.now().isoformat(),
-                "short_ce_entry": float(s_ce['sellavgprice']),
-                "short_pe_entry": float(s_pe['sellavgprice']),
-                "long_ce_entry": float(l_ce['buyavgprice']),
-                "long_pe_entry": float(l_pe['buyavgprice']),
-                "nifty_entry_price": index_ltp,
+            open_positions = self.api.get_open_positions()
+            live_symbols = {p['tradingsymbol'] for p in open_positions if int(p.get('netqty', 0)) != 0}
+            expected_symbols = {
+                self.short_ce_contract.symbol, self.short_pe_contract.symbol,
+                self.long_ce_contract.symbol, self.long_pe_contract.symbol
             }
-            self.trailing_sl_active = False # Reset for new position
-            self.peak_mtm = 0.0
-            self.last_activation_reduction_hour = 0
-            self._set_credit_decay_tp_level()
-            log.info(f"Resumed with entry prices and SLs.")
-        else:
-            log.info("No complete Iron Condor position found to resume.")
+            if not expected_symbols.issubset(live_symbols):
+                log.warning(f"{Fore.YELLOW}State file shows active position, but broker does not have all 4 legs open. Starting fresh.{Style.RESET_ALL}")
+                return False
+
+        # If we reach here, the state is valid for resuming
+        self.in_position = True
+        self.quantity = state_data.get("quantity", 0)
+        
+        # Set PNL targets based on the resumed state
+        self.take_profit_target = self.take_profit_points * self.quantity
+        self.absolute_stop_loss_target = self.absolute_stop_loss_points * self.quantity
+        activation_points = self.trailing_stop_config.get("activation_points", 6.0)
+        self.trailing_activation_mtm = activation_points * self.quantity
+
+        # Reset dynamic state variables
+        self.trailing_sl_active = False
+        self.peak_mtm = 0.0
+        self.last_activation_reduction_hour = 0
+        self._set_credit_decay_tp_level()
+
+        log.info(f"{Fore.GREEN}Resumed position from state file: Qty={self.quantity}{Style.RESET_ALL}")
+        log.info(f"{Fore.GREEN}Entry Spot Ref: {self.entry_info.get('nifty_entry_price', 'N/A')}{Style.RESET_ALL}")
+        return True
+
 
     def _calculate_closed_pnl(self) -> float:
-        trade_book = self.api.get_trade_book()
-        if not trade_book:
-            return 0.0
+        # In simulation mode, we never look at the real trade book. PNL starts at 0.
+        if not self.simulate_orders:
+            trade_book = self.api.get_trade_book()
+            if not trade_book:
+                return 0.0
 
-        condor_symbols = {
-            self.short_ce_contract.symbol,
-            self.short_pe_contract.symbol,
-            self.long_ce_contract.symbol,
-            self.long_pe_contract.symbol,
-        }
+            # This check is important for when the function is called before contracts are set
+            if not all([self.short_ce_contract, self.short_pe_contract, self.long_ce_contract, self.long_pe_contract]):
+                return 0.0
+                
+            condor_symbols = {
+                self.short_ce_contract.symbol,
+                self.short_pe_contract.symbol,
+                self.long_ce_contract.symbol,
+                self.long_pe_contract.symbol,
+            }
 
-        # Group trades by fill ID to identify related transactions
-        fills = defaultdict(list)
-        for trade in trade_book:
-            if trade.get('tradingsymbol') in condor_symbols:
-                fills[trade['fillid']].append(trade)
+            # Group trades by fill ID to identify related transactions
+            fills = defaultdict(list)
+            for trade in trade_book:
+                if trade.get('tradingsymbol') in condor_symbols:
+                    fills[trade['fillid']].append(trade)
 
-        pnl = 0.0
-        for fill_id, trades_in_fill in fills.items():
-            # A complete condor transaction (entry or exit) should have 4 trades.
-            if len(trades_in_fill) == 4:
-                for trade in trades_in_fill:
-                    price = float(trade['fillprice'])
-                    qty = int(trade['fillsize'])
-                    if trade['transactiontype'] == 'BUY':
-                        pnl -= price * qty
-                    elif trade['transactiontype'] == 'SELL':
-                        pnl += price * qty
-        
-        return pnl
+            pnl = 0.0
+            for fill_id, trades_in_fill in fills.items():
+                # A complete condor transaction (entry or exit) should have 4 trades.
+                if len(trades_in_fill) == 4:
+                    for trade in trades_in_fill:
+                        price = float(trade['fillprice'])
+                        qty = int(trade['fillsize'])
+                        if trade['transactiontype'] == 'BUY':
+                            pnl -= price * qty
+                        elif trade['transactiontype'] == 'SELL':
+                            pnl += price * qty
+            
+            return pnl
+        return 0.0 # Return 0 for simulation mode
 
     def _on_tick(self, payload: dict):
         try:
@@ -540,18 +594,14 @@ class IronCondorLive:
             sim_sp_entry = self.latest_ltp.get(self.short_pe_contract.token, 0.0)
             sim_lc_entry = self.latest_ltp.get(self.long_ce_contract.token, 0.0)
             sim_lp_entry = self.latest_ltp.get(self.long_pe_contract.token, 0.0)
-            sim_index_entry = self.latest_ltp.get(self.index_token, 0.0)
-            
-            if sim_index_entry == 0.0:
-                try:
-                    sim_index_entry = self.api.get_ltp(self.index_exchange, self.index_name, self.index_token)
-                    self.latest_ltp[self.index_token] = sim_index_entry
-                except Exception:
-                    pass
 
+            # For simulation entry, always use the spot reference price determined during strike selection
+            # This ensures consistency and avoids using a live tick price for a simulated entry.
+            sim_index_entry = self.spot_ref
             log.info(
                 f"event=ORDER_ENTRY_INIT | Triggered at NetCredit={current_net_credit:.2f}, VWAP={current_vwap:.2f} | "
-                f"Prices: S_CE={sim_sc_entry:.2f}, S_PE={sim_sp_entry:.2f}, L_CE={sim_lc_entry:.2f}, L_PE={sim_lp_entry:.2f}"
+                f"Prices: S_CE({self.short_ce_contract.strike})={sim_sc_entry:.2f}, S_PE({self.short_pe_contract.strike})={sim_sp_entry:.2f}, "
+                f"L_CE({self.long_ce_contract.strike})={sim_lc_entry:.2f}, L_PE({self.long_pe_contract.strike})={sim_lp_entry:.2f}"
             )
 
             self.in_position = True
@@ -560,9 +610,14 @@ class IronCondorLive:
                 "short_ce_entry": sim_sc_entry, "short_pe_entry": sim_sp_entry,
                 "long_ce_entry": sim_lc_entry, "long_pe_entry": sim_lp_entry,
                 "nifty_entry_price": sim_index_entry,
+                "short_ce_strike": self.short_ce_contract.strike,
+                "short_pe_strike": self.short_pe_contract.strike,
+                "long_ce_strike": self.long_ce_contract.strike,
+                "long_pe_strike": self.long_pe_contract.strike,
             }
             self._set_credit_decay_tp_level()
             log.info(f"{Fore.GREEN}SIMULATION: ENTRY CONFIRMED | Iron Condor position entered at {self.index_name} {sim_index_entry:.2f}.")
+            self._save_strategy_state()
             return
         
         try:
@@ -599,12 +654,17 @@ class IronCondorLive:
             "short_ce_entry": float(sc_details['averageprice']), "short_pe_entry": float(sp_details['averageprice']),
             "long_ce_entry": float(lc_details['averageprice']), "long_pe_entry": float(lp_details['averageprice']),
             "nifty_entry_price": index_entry_price,
+            "short_ce_strike": self.short_ce_contract.strike,
+            "short_pe_strike": self.short_pe_contract.strike,
+            "long_ce_strike": self.long_ce_contract.strike,
+            "long_pe_strike": self.long_pe_contract.strike,
         }
         log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | Iron Condor position entered at {self.index_name} {index_entry_price}.")
         self.trailing_sl_active = False # Reset for new position
         self.peak_mtm = 0.0
         self.last_activation_reduction_hour = 0
         self._set_credit_decay_tp_level()
+        self._save_strategy_state()
 
     def _execute_exit(self, exit_reason="STRATEGY_EXIT"):
         log.info(f"event=ORDER_EXIT_INIT | Triggered by: {exit_reason}")
@@ -619,6 +679,7 @@ class IronCondorLive:
                 simulated_open_pnl = (entry_net_credit - current_net_credit) * self.quantity
                 self.closed_pnl += simulated_open_pnl
             self.in_position = False
+            self._save_strategy_state()
             self.trading_active = False # Stop trading for the day
             log.info(f"{Fore.GREEN}SIMULATION: EXIT CONFIRMED | All 4 exit orders simulated. New Closed PNL: {self.closed_pnl:.2f}. Reason={exit_reason}{Style.RESET_ALL}")
             self._close_ws()
@@ -631,6 +692,7 @@ class IronCondorLive:
         self.api.place_order(self.long_pe_contract.symbol, self.long_pe_contract.token, self.quantity, "SELL")
         
         self.in_position = False
+        self._save_strategy_state()
         self.trading_active = False # Stop trading for the day
         time_module.sleep(2) # Give time for orders to be updated in tradebook
         self.closed_pnl = self._calculate_closed_pnl()
@@ -687,7 +749,19 @@ class IronCondorLive:
             nifty_str = f"{self.index_name}: {nifty_ltp:.2f} ({nifty_color}{nifty_change:+.2f}{Style.RESET_ALL})"
 
             pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-            log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f}, VWAP={vwap:.2f} | Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
+
+            # --- Color logic for short legs ---
+            short_ce_entry = self.entry_info.get('short_ce_entry', s_ce_ltp)
+            # For a short position, a lower price is profit (green), a higher price is loss (red).
+            ce_color = Fore.GREEN if s_ce_ltp <= short_ce_entry else Fore.RED
+            ce_price_str = f"{ce_color}{s_ce_ltp:.2f}{Style.RESET_ALL}"
+
+            short_pe_entry = self.entry_info.get('short_pe_entry', s_pe_ltp)
+            pe_color = Fore.GREEN if s_pe_ltp <= short_pe_entry else Fore.RED
+            pe_price_str = f"{pe_color}{s_pe_ltp:.2f}{Style.RESET_ALL}"
+
+            log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f} (CE:{ce_price_str}, PE:{pe_price_str}), VWAP={vwap:.2f} | "
+                     f"Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
 
             # --- CREDIT DECAY TAKE PROFIT (Primary TP) ---
             if self.credit_decay_tp_level > 0 and net_credit <= self.credit_decay_tp_level:
@@ -761,8 +835,22 @@ class IronCondorLive:
                     self._execute_exit(exit_reason="TRAILING_STOP_LOSS")
 
     def run(self):
-        self.prepare_contracts()
-        self._check_and_resume_position()
+        # 1. First, try to resume an existing position
+        resumed = self._check_and_resume_position()
+
+        if not resumed:
+            # 2. If no position, wait for start time if in LIVE mode
+            if not self.simulate_orders:
+                now = datetime.now()
+                start_time = dt_time(9, 45)
+                if now.time() < start_time:
+                    wait_seconds = (datetime.combine(now.date(), start_time) - now).total_seconds()
+                    if wait_seconds > 0:
+                        log.info(f"{Fore.YELLOW}Current time is {now.strftime('%H:%M')}. Waiting until {start_time.strftime('%H:%M')} to select strikes and start trading...{Style.RESET_ALL}")
+                        time_module.sleep(wait_seconds)
+            
+            # 3. Prepare contracts for a new entry
+            self.prepare_contracts()
 
         if self.in_position:
             log.info("Starting WebSocket to monitor existing position.")
