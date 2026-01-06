@@ -126,8 +126,7 @@ def _adjust_for_price_difference( # type: ignore
     l_pe_p = get_historical_price(l_pe_c)
 
     if any(p is None for p in [s_ce_p, l_ce_p, s_pe_p, l_pe_p]):
-        log.warning(f"{Fore.RED}Skipping credit balance adjustment: Could not fetch prices for all legs.{Style.RESET_ALL}")
-        return ce_strike, pe_strike
+        raise RuntimeError("Could not fetch prices for all legs during price balance adjustment.")
 
     ce_side_credit = s_ce_p - l_ce_p
     pe_side_credit = s_pe_p - l_pe_p
@@ -310,8 +309,7 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             pe_price = get_historical_price(temp_pe_contract)
 
             if ce_price is None or pe_price is None:
-                log.warning(f"{Fore.RED}Cannot perform credit check: Price missing (CE={ce_price}, PE={pe_price}){Style.RESET_ALL}")
-                break
+                raise RuntimeError(f"Cannot perform credit check: Price missing for short legs (CE={ce_price}, PE={pe_price})")
 
             # --- Hedge Leg Liquidity Search ---
             # For Long CE
@@ -327,8 +325,7 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
                 log.warning(f"No data for hedge CE at {current_long_ce_strike}. Moving one step closer.")
                 current_long_ce_strike -= strike_step
             if long_ce_price is None:
-                log.error(f"{Fore.RED}Could not find a liquid hedge for CE. Using 0.0 price.{Style.RESET_ALL}")
-                long_ce_price = 0.0
+                raise RuntimeError("Could not find a liquid hedge for CE after multiple attempts.")
             final_long_ce_strike = current_long_ce_strike
 
             # For Long PE
@@ -344,8 +341,7 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
                 log.warning(f"No data for hedge PE at {current_long_pe_strike}. Moving one step closer.")
                 current_long_pe_strike += strike_step
             if long_pe_price is None:
-                log.error(f"{Fore.RED}Could not find a liquid hedge for PE. Using 0.0 price.{Style.RESET_ALL}")
-                long_pe_price = 0.0
+                raise RuntimeError("Could not find a liquid hedge for PE after multiple attempts.")
             final_long_pe_strike = current_long_pe_strike
 
             current_net_credit = (ce_price + pe_price) - (long_ce_price + long_pe_price)

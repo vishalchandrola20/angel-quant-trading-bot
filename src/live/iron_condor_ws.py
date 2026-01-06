@@ -159,6 +159,9 @@ class IronCondorLive:
 
         self.events_dir = Path("data/live")
         self.events_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir = Path("data/state")
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
         self.csv_path = self.events_dir / f"iron_condor_events_{self.trading_date}.csv"
         self._ensure_csv()
 
@@ -241,7 +244,7 @@ class IronCondorLive:
         """Saves the current strategy state to the JSON file."""
         if not self.state_file:
             mode_str = "live" if not self.simulate_orders else "sim"
-            self.state_file = self.events_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
+            self.state_file = self.state_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
 
         data = {
             "in_position": self.in_position,
@@ -261,7 +264,7 @@ class IronCondorLive:
 
     def prepare_contracts(self):
         mode_str = "live" if not self.simulate_orders else "sim"
-        self.state_file = self.events_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
+        self.state_file = self.state_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
         strikes_data = {}
 
         if self.state_file.exists():
@@ -435,7 +438,7 @@ class IronCondorLive:
     def _check_and_resume_position(self) -> bool:
         log.info("Checking for existing position state to resume...")
         mode_str = "live" if not self.simulate_orders else "sim"
-        self.state_file = self.events_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
+        self.state_file = self.state_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
 
         if not self.state_file.exists():
             log.info(f"No state file found at {self.state_file}. Starting fresh.")
@@ -746,7 +749,19 @@ class IronCondorLive:
             nifty_str = f"{self.index_name}: {nifty_ltp:.2f} ({nifty_color}{nifty_change:+.2f}{Style.RESET_ALL})"
 
             pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-            log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f}, VWAP={vwap:.2f} | Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
+
+            # --- Color logic for short legs ---
+            short_ce_entry = self.entry_info.get('short_ce_entry', s_ce_ltp)
+            # For a short position, a lower price is profit (green), a higher price is loss (red).
+            ce_color = Fore.GREEN if s_ce_ltp <= short_ce_entry else Fore.RED
+            ce_price_str = f"{ce_color}{s_ce_ltp:.2f}{Style.RESET_ALL}"
+
+            short_pe_entry = self.entry_info.get('short_pe_entry', s_pe_ltp)
+            pe_color = Fore.GREEN if s_pe_ltp <= short_pe_entry else Fore.RED
+            pe_price_str = f"{pe_color}{s_pe_ltp:.2f}{Style.RESET_ALL}"
+
+            log.info(f"event=PNL_UPDATE | NetCredit={net_credit:.2f} (CE:{ce_price_str}, PE:{pe_price_str}), VWAP={vwap:.2f} | "
+                     f"Total PNL: {pnl_color}{total_pnl:+.2f}{Style.RESET_ALL} | {nifty_str}")
 
             # --- CREDIT DECAY TAKE PROFIT (Primary TP) ---
             if self.credit_decay_tp_level > 0 and net_credit <= self.credit_decay_tp_level:
