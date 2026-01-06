@@ -34,7 +34,7 @@ def get_index_first_15m_close(index_name: str, trading_date: date | None = None)
     now = datetime.now()
 
     # Always target the first 15-minute candle of the day (9:15 - 9:30)
-    first_candle_end_time = datetime.combine(trading_date, dt_time(9, 30))
+    first_candle_end_time = datetime.combine(trading_date, dt_time(9, 45))
 
     # If running before the first candle is complete, wait.
     if now < first_candle_end_time:
@@ -44,7 +44,7 @@ def get_index_first_15m_close(index_name: str, trading_date: date | None = None)
 
     # Set the time window to always be the first 15-minute candle
     start_dt = datetime.combine(trading_date, dt_time(9, 15))
-    end_dt = datetime.combine(trading_date, dt_time(9, 30))
+    end_dt = datetime.combine(trading_date, dt_time(9, 45))
     start_dt = end_dt - timedelta(minutes=15)
 
     from_str = start_dt.strftime("%Y-%m-%d %H:%M")

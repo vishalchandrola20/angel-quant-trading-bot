@@ -237,14 +237,15 @@ class IronCondorLive:
             log.error(f"Could not reload strategy params: {e}")
 
     def prepare_contracts(self):
-        self.state_file = self.events_dir / f"state_{self.index_name}_{self.trading_date}.json"
+        mode_str = "live" if not self.simulate_orders else "sim"
+        self.state_file = self.events_dir / f"state_{mode_str}_{self.index_name}_{self.trading_date}.json"
         strikes_data = {}
 
         if self.state_file.exists():
             try:
                 with open(self.state_file, 'r') as f:
                     strikes_data = json.load(f)
-                log.info(f"{Fore.CYAN}Recovered strikes from state file: {self.state_file}{Style.RESET_ALL}")
+                log.info(f"{Fore.CYAN}Recovered strikes from state file for {mode_str.upper()} mode: {self.state_file}{Style.RESET_ALL}")
             except Exception as e:
                 log.error(f"Failed to load state file: {e}")
 
@@ -273,7 +274,7 @@ class IronCondorLive:
             try:
                 with open(self.state_file, 'w') as f:
                     json.dump(strikes_data, f, indent=4)
-                log.info(f"Saved strikes to state file: {self.state_file}")
+                log.info(f"Saved strikes to state file for {mode_str.upper()} mode: {self.state_file}")
             except Exception as e:
                 log.error(f"Failed to write state file: {e}")
 
@@ -551,7 +552,8 @@ class IronCondorLive:
 
             log.info(
                 f"event=ORDER_ENTRY_INIT | Triggered at NetCredit={current_net_credit:.2f}, VWAP={current_vwap:.2f} | "
-                f"Prices: S_CE={sim_sc_entry:.2f}, S_PE={sim_sp_entry:.2f}, L_CE={sim_lc_entry:.2f}, L_PE={sim_lp_entry:.2f}"
+                f"Prices: S_CE({self.short_ce_contract.strike})={sim_sc_entry:.2f}, S_PE({self.short_pe_contract.strike})={sim_sp_entry:.2f}, "
+                f"L_CE({self.long_ce_contract.strike})={sim_lc_entry:.2f}, L_PE({self.long_pe_contract.strike})={sim_lp_entry:.2f}"
             )
 
             self.in_position = True
@@ -560,6 +562,10 @@ class IronCondorLive:
                 "short_ce_entry": sim_sc_entry, "short_pe_entry": sim_sp_entry,
                 "long_ce_entry": sim_lc_entry, "long_pe_entry": sim_lp_entry,
                 "nifty_entry_price": sim_index_entry,
+                "short_ce_strike": self.short_ce_contract.strike,
+                "short_pe_strike": self.short_pe_contract.strike,
+                "long_ce_strike": self.long_ce_contract.strike,
+                "long_pe_strike": self.long_pe_contract.strike,
             }
             self._set_credit_decay_tp_level()
             log.info(f"{Fore.GREEN}SIMULATION: ENTRY CONFIRMED | Iron Condor position entered at {self.index_name} {sim_index_entry:.2f}.")
@@ -599,6 +605,10 @@ class IronCondorLive:
             "short_ce_entry": float(sc_details['averageprice']), "short_pe_entry": float(sp_details['averageprice']),
             "long_ce_entry": float(lc_details['averageprice']), "long_pe_entry": float(lp_details['averageprice']),
             "nifty_entry_price": index_entry_price,
+            "short_ce_strike": self.short_ce_contract.strike,
+            "short_pe_strike": self.short_pe_contract.strike,
+            "long_ce_strike": self.long_ce_contract.strike,
+            "long_pe_strike": self.long_pe_contract.strike,
         }
         log.info(f"{Fore.GREEN}event=ENTRY_CONFIRMED | Iron Condor position entered at {self.index_name} {index_entry_price}.")
         self.trailing_sl_active = False # Reset for new position

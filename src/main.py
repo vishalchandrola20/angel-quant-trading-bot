@@ -106,12 +106,12 @@ def main():
         target_time = datetime.strptime(args.time, "%H:%M").time()
         target_dt = datetime.combine(trading_date, target_time)
 
+        expiry_str = args.expiry or None
         spot, spot_candle_end_time = get_index_first_15m_close("NIFTY", trading_date)
-        strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, "NIFTY", trading_date)
+        strikes_info = get_single_ce_pe_strikes(spot, spot_candle_end_time, "NIFTY", trading_date, expiry_str=expiry_str)
         short_ce_strike, short_pe_strike, long_ce_strike, long_pe_strike = \
             strikes_info["ce_strike"], strikes_info["pe_strike"], strikes_info["long_ce_strike"], strikes_info["long_pe_strike"]
 
-        expiry_str = args.expiry or None
         short_ce_contract = find_option("NIFTY", short_ce_strike, "CE", expiry_str, trading_date)
         short_pe_contract = find_option("NIFTY", short_pe_strike, "PE", expiry_str, trading_date)
         long_ce_contract = find_option("NIFTY", long_ce_strike, "CE", expiry_str, trading_date)
