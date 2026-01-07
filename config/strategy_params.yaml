@@ -12,7 +12,7 @@ NIFTY:
       - { pnl_above: 1760, reversal_pct: 0.70 }
       - { pnl_above: 1480, reversal_pct: 0.50 }
       - { pnl_above: 1100, reversal_pct: 0.40 }
-      - { pnl_above: 780, reversal_pct: 0.30 }
+      - { pnl_above: 780, reversal_pct: 0.25 }
     increment:
       base_pnl: 2000
       pnl_step: 100

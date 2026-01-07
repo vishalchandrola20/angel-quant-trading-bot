@@ -360,12 +360,14 @@ class IronCondorLive:
             else:  # <= 90
                 target_credit_decay_pct = 0.45  # PNL is 55% of entry credit
         else:  # NIFTY
-            if entry_net_credit > 42:
-                target_credit_decay_pct = 0.55  # PNL is 45% of entry credit
-            elif 30 < entry_net_credit <= 42:
-                target_credit_decay_pct = 0.50  # PNL is 50% of entry credit
+            if entry_net_credit > 35:
+                target_credit_decay_pct = 0.70  # PNL is 25% of entry credit
+            elif 30 < entry_net_credit <= 35:
+                target_credit_decay_pct = 0.70  # PNL is 30% of entry credit
+            elif 20 < entry_net_credit <= 30:
+                target_credit_decay_pct = 0.60  # PNL is 30% of entry credit
             else:  # Covers range <= 30
-                target_credit_decay_pct = 0.45  # PNL is 55% of entry credit
+                target_credit_decay_pct = 0.55  # PNL is 40% of entry credit
 
         if target_credit_decay_pct > 0:
             self.credit_decay_tp_level = entry_net_credit * target_credit_decay_pct

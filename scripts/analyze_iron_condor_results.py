@@ -63,7 +63,7 @@ def analyze_single_day(csv_path: Path) -> dict | None:
     max_loss_trade = trade_slice["min_pnl_in_bar"].min()
 
     # --- Full-Day P&L (relative to entry) ---
-    df_after_930 = df[df['ts'].dt.time >= pd.to_datetime('09:30').time()]
+    df_after_930 = df[df['ts'].dt.time >= pd.to_datetime('09:30').time()].copy()
     df_after_930["max_pnl_in_bar_day"] = (entry_net_credit - df_after_930["net_credit_low"])
     df_after_930["min_pnl_in_bar_day"] = (entry_net_credit - df_after_930["net_credit_high"])
     
