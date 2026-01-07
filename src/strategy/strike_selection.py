@@ -225,10 +225,10 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
         dte = _get_trading_days_to_expiry(trading_date, expiry_date)
 
         if dte <= 1:  # 0 and 1 DTE (e.g., Tuesday, Monday for a Tuesday expiry)
-            strike_offset = 300
+            strike_offset = 250
             hedge_offset = 200
         elif dte <= 3:  # 2 and 3 DTE (e.g., Friday, Thursday)
-            strike_offset = 400
+            strike_offset = 350
             hedge_offset = 200
         else:  # 4+ DTE
             strike_offset = 400
