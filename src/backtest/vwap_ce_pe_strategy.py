@@ -1,8 +1,10 @@
 # src/backtest/vwap_ce_pe_strategy.py
 from __future__ import annotations
 
+import math
 import logging
 from dataclasses import dataclass
+import yaml
 from datetime import datetime, date, time
 import time as time_module
 
@@ -19,33 +21,21 @@ logging.basicConfig(level=logging.INFO)
 
 INDEX_CONFIG = {
     "NIFTY": {
-        "lot_size": 130,
         "token": "99926000",
         "exchange": "NSE",
         "options_exchange": "NFO",
         "exchange_type": 1,
         "options_exchange_type": 2,
         "strike_step": 50,
-        "spot_proximity_exit_points": 40,
-        "take_profit_per_lot": 20.0,
-        "absolute_stop_loss_per_lot": 8.0,
-        "trailing_activation_mtm_per_lot": 8.0, # 1000 / 50 lots
-        "trailing_sl_reversal_pct": 0.70,
     },
 
     "SENSEX": {
-        "lot_size": 60,
         "token": "99919000",
         "exchange": "BSE",
         "options_exchange": "BFO",
         "exchange_type": 3,
         "options_exchange_type": 4,
         "strike_step": 100,
-        "spot_proximity_exit_points": 60,
-        "take_profit_per_lot": 50.0,
-        "absolute_stop_loss_per_lot": 15.0,
-        "trailing_activation_mtm_per_lot": 20, # 1000 / 60 lots
-        "trailing_sl_reversal_pct": 0.70,
     }
 }
 
@@ -179,17 +169,30 @@ def run_iron_condor_strategy_for_day(
         bar_interval: str = "ONE_MINUTE",
         expiry_str: str | None = None,
         export_csv: bool = True):
-    log.info("--- Iron Condor Strategy ---")
-    log.info(f"trading_date={trading_date}")
+    log.info("--- Iron Condor Strategy Backtest ---")
+    log.info(f"trading_date={trading_date}, index={index_name}")
 
-    index_name = index_name.upper()
-    config = INDEX_CONFIG.get(index_name, INDEX_CONFIG["NIFTY"])
-    lot_size = config["lot_size"]
-    absolute_stop_loss = config["absolute_stop_loss_per_lot"] * lot_size
-    take_profit_points = config["take_profit_per_lot"] * lot_size
-    trailing_activation_mtm = config["trailing_activation_mtm_per_lot"] * lot_size
-    trailing_sl_reversal_pct = config["trailing_sl_reversal_pct"]
+    # Load strategy parameters from YAML
+    with open("config/strategy_params.yaml", 'r') as f:
+        params = yaml.safe_load(f)
 
+    index_params = params.get(index_name.upper(), {})
+    lot_size = index_params.get("lot_size", 50)
+    num_lots = index_params.get("num_lots", 1)
+    quantity = lot_size * num_lots
+
+    take_profit_target = index_params.get("take_profit_points", 20.0) * quantity
+    absolute_stop_loss_target = index_params.get("absolute_stop_loss_points", 20.0) * quantity
+
+    trailing_stop_config = index_params.get("trailing_stop", {})
+    activation_points = trailing_stop_config.get("activation_points", 6.0)
+    trailing_activation_mtm = activation_points * quantity
+
+    # Sort tiers for easy lookup
+    if trailing_stop_config.get("tiers"):
+        trailing_stop_config["tiers"].sort(key=lambda x: x['pnl_above'], reverse=True)
+
+    log.info(f"Backtest configured for Quantity={quantity}, TP={take_profit_target}, SL={absolute_stop_loss_target}")
 
     bars, short_ce_sym, short_pe_sym, long_ce_sym, long_pe_sym = _fetch_intraday_bars_for_iron_condor(trading_date, index_name, bar_interval, expiry_str)
 
@@ -202,6 +205,33 @@ def run_iron_condor_strategy_for_day(
     trailing_sl_active = False
     peak_mtm = 0.0
     records: list[dict] = []
+
+    def get_trailing_reversal_pct(current_peak_mtm: float) -> float:
+        """Determines the current trailing SL reversal percentage based on peak MTM."""
+        config = trailing_stop_config
+        peak = current_peak_mtm
+
+        # Default to the lowest tier's percentage if no other condition is met
+        base_pct = 0.0
+        if config.get('tiers'):
+            base_pct = config['tiers'][-1]['reversal_pct']
+
+        # Check for incremental increase
+        increment_config = config.get('increment')
+        if increment_config and peak > increment_config['base_pnl']:
+            base_tier_pct = next((t['reversal_pct'] for t in config['tiers'] if increment_config['base_pnl'] >= t['pnl_above']), base_pct)
+            pnl_above_base = peak - increment_config['base_pnl']
+            num_steps = math.floor(pnl_above_base / increment_config['pnl_step'])
+            pct_increase = num_steps * increment_config['pct_increase']
+            final_pct = base_tier_pct + pct_increase
+            return min(final_pct, increment_config.get('max_pct', 0.95))
+
+        # Check static tiers (sorted descending by pnl_above)
+        for tier in config.get('tiers', []):
+            if peak >= tier['pnl_above']:
+                return tier['reversal_pct']
+
+        return base_pct
 
     for i, bar in enumerate(bars):
         bar_time = datetime.strptime(bar.ts, "%Y-%m-%dT%H:%M:%S%z").time()
@@ -240,19 +270,19 @@ def run_iron_condor_strategy_for_day(
 
                 # Calculate PNL based on the high and low of the net credit to get a true picture of the bar's range
                 # Max profit in the bar occurs at the lowest credit value.
-                max_pnl_in_bar = (entry_net_credit - bar.net_credit_low) * lot_size
+                max_pnl_in_bar = (entry_net_credit - bar.net_credit_low) * quantity
                 # Max loss in the bar occurs at the highest credit value.
-                min_pnl_in_bar = (entry_net_credit - bar.net_credit_high) * lot_size
+                min_pnl_in_bar = (entry_net_credit - bar.net_credit_high) * quantity
 
                 # PNL at the close of the bar for final calculation if an exit is triggered.
-                pnl_at_close = (entry_net_credit - bar.net_credit_close) * lot_size
+                pnl_at_close = (entry_net_credit - bar.net_credit_close) * quantity
                 pnl = pnl_at_close
                 
                 temp_exit_reason = None
                 # Check exit conditions based on the bar's range
-                if max_pnl_in_bar >= take_profit_points:
+                if max_pnl_in_bar >= take_profit_target:
                     temp_exit_reason = "TAKE_PROFIT"
-                elif min_pnl_in_bar <= -absolute_stop_loss:
+                elif min_pnl_in_bar <= -absolute_stop_loss_target:
                     temp_exit_reason = "STOP_LOSS_ABS"
                 
                 # Trailing Stop Loss on Profit
@@ -264,16 +294,17 @@ def run_iron_condor_strategy_for_day(
                 if trailing_sl_active:
                     new_peak_mtm = max(peak_mtm, max_pnl_in_bar)
                     if new_peak_mtm > peak_mtm:
-                        peak_mtm_points = new_peak_mtm / lot_size
+                        peak_mtm_points = new_peak_mtm / quantity
                         log.info(f"Peak MTM updated: Abs={new_peak_mtm:.2f} | Pts={peak_mtm_points:.2f}")
                         peak_mtm = new_peak_mtm
 
-                    trailing_stop_level = peak_mtm * trailing_sl_reversal_pct
+                    current_reversal_pct = get_trailing_reversal_pct(peak_mtm)
+                    trailing_stop_level = peak_mtm * current_reversal_pct
                     # If the bar's worst PNL (min_pnl_in_bar) breaches the trailing stop, exit.
                     if min_pnl_in_bar <= trailing_stop_level:
-                        log.info(f"Trailing SL triggered at PNL: {min_pnl_in_bar:.2f}")
+                        log.info(f"Trailing SL triggered. Current PNL {min_pnl_in_bar:.2f} <= {current_reversal_pct*100:.0f}% of Peak PNL {peak_mtm:.2f}")
                         temp_exit_reason = "TRAILING_STOP_LOSS"
-                        pnl = peak_mtm*trailing_sl_reversal_pct
+                        pnl = trailing_stop_level # Book profit at the stop level
 
                 if temp_exit_reason:
                     in_position = False
@@ -302,10 +333,10 @@ def run_iron_condor_strategy_for_day(
         log.info(f"EXIT (EOD) at {last_bar.ts}: Net Credit={last_bar.net_credit_close:.2f}")
 
     if entry_index is not None:
-        pnl_per_lot = (entry_bar.net_credit_close - exit_bar.net_credit_close) * lot_size
+        final_pnl = (entry_bar.net_credit_close - exit_bar.net_credit_close) * quantity
         if exit_reason == "TRAILING_STOP_LOSS":
-            pnl_per_lot = peak_mtm * 0.60
-        print(f"\n--- Day Summary ---\nDate: {trading_date}, PNL: {pnl_per_lot:.2f}, Reason: {exit_reason}")
+            final_pnl = peak_mtm * get_trailing_reversal_pct(peak_mtm)
+        print(f"\n--- Day Summary ---\nDate: {trading_date}, PNL: {final_pnl:.2f}, Reason: {exit_reason}")
 
     if export_csv:
         out_dir = Path(f"data/processed/iron_condor/{index_name.lower()}")

@@ -139,7 +139,7 @@ def _adjust_for_price_difference( # type: ignore
 
     credit_diff_pct = abs(ce_side_credit - pe_side_credit) / max(ce_side_credit, pe_side_credit)
 
-    if credit_diff_pct <= 0.15:
+    if credit_diff_pct <= 0.20:
         log.info(f"{Fore.GREEN}Side credits difference {credit_diff_pct:.1%} is within 15% limit.{Style.RESET_ALL}")
         return ce_strike, pe_strike
 
@@ -164,7 +164,7 @@ def _adjust_for_price_difference( # type: ignore
         log.info(f"{Fore.CYAN}After moving CE spread: New CE Credit={ce_side_credit_new:.2f}. New diff: {new_diff_pct:.1%}{Style.RESET_ALL}")
 
         # Step 2: If still imbalanced, move the cheaper side CLOSER
-        if new_diff_pct > 0.15:
+        if new_diff_pct > 0.20:
             log.warning(f"Diff still > 15%. Moving PE (Cheaper) CLOSER (Strike +{strike_step}).")
             pe_strike += strike_step
     else:  # PE side is more expensive
@@ -183,7 +183,7 @@ def _adjust_for_price_difference( # type: ignore
         new_diff_pct = abs(ce_side_credit - pe_side_credit_new) / max(ce_side_credit, pe_side_credit_new)
         log.info(f"{Fore.CYAN}After moving PE spread: New PE Credit={pe_side_credit_new:.2f}. New diff: {new_diff_pct:.1%}{Style.RESET_ALL}")
 
-        if new_diff_pct > 0.15:
+        if new_diff_pct > 0.20:
             log.warning(f"Diff still > 15%. Moving CE (Cheaper) CLOSER (Strike -{strike_step}).")
             ce_strike -= strike_step
 
@@ -226,12 +226,12 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
 
         if dte <= 1:  # 0 and 1 DTE (e.g., Tuesday, Monday for a Tuesday expiry)
             strike_offset = 300
-            hedge_offset = 300
+            hedge_offset = 200
         elif dte <= 3:  # 2 and 3 DTE (e.g., Friday, Thursday)
-            strike_offset = 500
+            strike_offset = 400
             hedge_offset = 200
         else:  # 4+ DTE
-            strike_offset = 500
+            strike_offset = 400
             hedge_offset = 200
         log.info(f"NIFTY expiry is in {dte} trading days. Selected strike offset: {strike_offset}, hedge offset: {hedge_offset}")
 
@@ -286,8 +286,10 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             else: min_net_credit = 90
         else: # NIFTY
             if dte <= 1: min_net_credit = 20
-            elif dte <= 4: min_net_credit = 25
-            else: min_net_credit = 30
+            elif dte <= 2: min_net_credit = 23
+            elif dte <= 3: min_net_credit = 27
+            elif dte <= 4: min_net_credit = 30
+            else: min_net_credit = 35
 
         log.info(f"DTE is {dte}. Minimum required net credit set to: {min_net_credit}")
 
