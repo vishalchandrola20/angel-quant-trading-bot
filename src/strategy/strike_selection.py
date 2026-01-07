@@ -228,10 +228,10 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             strike_offset = 300
             hedge_offset = 300
         elif dte <= 3:  # 2 and 3 DTE (e.g., Friday, Thursday)
-            strike_offset = 500
+            strike_offset = 400
             hedge_offset = 200
         else:  # 4+ DTE
-            strike_offset = 500
+            strike_offset = 400
             hedge_offset = 200
         log.info(f"NIFTY expiry is in {dte} trading days. Selected strike offset: {strike_offset}, hedge offset: {hedge_offset}")
 
@@ -286,8 +286,8 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             else: min_net_credit = 90
         else: # NIFTY
             if dte <= 1: min_net_credit = 20
-            elif dte <= 4: min_net_credit = 25
-            else: min_net_credit = 30
+            elif dte <= 4: min_net_credit = 30
+            else: min_net_credit = 35
 
         log.info(f"DTE is {dte}. Minimum required net credit set to: {min_net_credit}")
 
