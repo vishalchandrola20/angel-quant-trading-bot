@@ -286,6 +286,8 @@ def get_single_ce_pe_strikes(spot: float, spot_candle_end_time: datetime, index_
             else: min_net_credit = 90
         else: # NIFTY
             if dte <= 1: min_net_credit = 20
+            elif dte <= 2: min_net_credit = 23
+            elif dte <= 3: min_net_credit = 27
             elif dte <= 4: min_net_credit = 30
             else: min_net_credit = 35
 
