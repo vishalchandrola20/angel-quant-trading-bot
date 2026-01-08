@@ -1,0 +1,11 @@
+NIFTY:
+  lot_size: 65
+  num_lots: 1
+  sl_points: 10
+  target_points: 15
+
+SENSEX:
+  lot_size: 20
+  num_lots: 1
+  sl_points: 10
+  target_points: 15
