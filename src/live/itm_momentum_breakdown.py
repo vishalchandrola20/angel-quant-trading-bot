@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time as time_module
 import json
 import yaml
@@ -77,6 +78,12 @@ class ITMMomentumStrategy:
         self.last_config_mtime = 0
         self.sl_points = 10
         self.target_points = 15
+        self.trailing_activation_points = 10
+        self.trailing_distance_points = 10
+        self.ce_setup_allowed = True
+        self.pe_setup_allowed = True
+        self.current_ce_setup_discard = False
+        self.current_pe_setup_discard = False
         self._load_config()
 
         # State Variables
@@ -88,6 +95,7 @@ class ITMMomentumStrategy:
         self.in_position = False
         self.position_info: Dict[str, Any] = {}
         self.closed_pnl = 0.0
+        self.last_exit_time: datetime | None = None
         
         self.ws = None
         self.subscribed_tokens = {self.index_token} # Always subscribe to Spot
@@ -116,10 +124,16 @@ class ITMMomentumStrategy:
                     self.num_lots = idx_config.get("num_lots", self.num_lots)
                     self.sl_points = idx_config.get("sl_points", self.sl_points)
                     self.target_points = idx_config.get("target_points", self.target_points)
+                    self.trailing_activation_points = idx_config.get("trailing_activation_points", self.trailing_activation_points)
+                    self.trailing_distance_points = idx_config.get("trailing_distance_points", self.trailing_distance_points)
+                    self.ce_setup_allowed = idx_config.get("ce_setup_allowed", self.ce_setup_allowed)
+                    self.pe_setup_allowed = idx_config.get("pe_setup_allowed", self.pe_setup_allowed)
+                    self.current_ce_setup_discard = idx_config.get("current_ce_setup_discard", False)
+                    self.current_pe_setup_discard = idx_config.get("current_pe_setup_discard", False)
                     
                     self.quantity = self.lot_size * self.num_lots
                     self.last_config_mtime = mtime
-                    log.info(f"Config Loaded: Qty={self.quantity}, SL={self.sl_points}, Target={self.target_points}")
+                    log.info(f"Config Loaded: Qty={self.quantity}, SL={self.sl_points}, Target={self.target_points}, TrailAct={self.trailing_activation_points}, TrailDist={self.trailing_distance_points}")
                     updated = True
             except Exception as e:
                 log.error(f"Error loading config: {e}")
@@ -127,13 +141,17 @@ class ITMMomentumStrategy:
 
     def _get_itm_strike(self, spot: float, option_type: str) -> int:
         """
-        Returns the strike 1 step ITM relative to the nearest ATM.
+        Returns the nearest ITM/ATM strike.
+        CE = Floor(Spot), PE = Ceil(Spot)
         """
-        atm = round(spot / self.strike_step) * self.strike_step
+        strike = 0
         if option_type == "CE":
-            return atm - self.strike_step # ITM Call is lower
+            strike = int(math.floor(spot / self.strike_step) * self.strike_step)
         else:
-            return atm + self.strike_step # ITM Put is higher
+            strike = int(math.ceil(spot / self.strike_step) * self.strike_step)
+        
+        log.info(f"Strike Selection: Input Spot={spot}, Type={option_type}, Step={self.strike_step} -> Selected Strike={strike}")
+        return strike
 
     def _fetch_last_n_candles(self, token: str, exchange: str, n: int = 3) -> List[List]:
         """Fetches the last N completed 1-minute candles."""
@@ -204,8 +222,12 @@ class ITMMomentumStrategy:
             c0 = None
             c1, c2, c3 = candles[0], candles[1], candles[2]
         
+        # Avoid overlap with previous trade: Ensure the pattern starts AFTER the last exit
+        if self.last_exit_time and c1['ts'] <= self.last_exit_time:
+            return
+
         # Check 3 Green Candles (Put Setup)
-        if c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open']:
+        if self.pe_setup_allowed and c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open']:
             is_continuation = False
             if self.active_pe_setup:
                 if c0 and c0['close'] > c0['open']:
@@ -216,7 +238,7 @@ class ITMMomentumStrategy:
                 self._initiate_setup("PE", c1, c3['close'])
 
         # Check 3 Red Candles (Call Setup)
-        elif c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open']:
+        elif self.ce_setup_allowed and c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open']:
             is_continuation = False
             if self.active_ce_setup:
                 if c0 and c0['close'] < c0['open']:
@@ -228,20 +250,20 @@ class ITMMomentumStrategy:
 
     def _initiate_setup(self, setup_type: str, ref_candle: dict, current_spot: float):
         """Prepares the setup triggers."""
-        # 1. Select ITM Strike based on CURRENT spot (at end of pattern)
-        strike = self._get_itm_strike(current_spot, setup_type)
+        # 1. Define Triggers
+        spot_trigger = ref_candle['low'] if setup_type == "PE" else ref_candle['high']
+
+        # 2. Select ITM Strike based on SPOT TRIGGER (Entry Level)
+        strike = self._get_itm_strike(spot_trigger, setup_type)
         contract = find_option(self.index_name, strike, setup_type, self.expiry, self.trading_date)
         
-        # 2. Get Option High during the Reference Candle (1st candle)
+        # 3. Get Option High during the Reference Candle (1st candle)
         opt_high = self._get_option_high_at_time(contract, ref_candle['ts'])
         
         if opt_high is None:
             log.error(f"Could not fetch history for {contract.symbol}. Setup aborted.")
             return
 
-        # 3. Define Triggers
-        spot_trigger = ref_candle['low'] if setup_type == "PE" else ref_candle['high']
-        
         setup_data = {
             "type": setup_type,
             "contract": contract,
@@ -256,8 +278,9 @@ class ITMMomentumStrategy:
         # Subscribe to the option token for live monitoring
         self._subscribe_to_token(contract.token)
         
+        setup_time_str = setup_data['ts'].strftime("%H:%M:%S")
         log.info(
-            f"{Fore.GREEN}SETUP ARMED ({setup_type}): {contract.symbol} | "
+            f"{Fore.GREEN}SETUP ARMED ({setup_type}) at {setup_time_str}: {contract.symbol} | "
             f"Spot Trigger: Break {'Below' if setup_type=='PE' else 'Above'} {spot_trigger} | "
             f"Option Trigger: Break Above {opt_high}{Style.RESET_ALL}"
         )
@@ -301,6 +324,7 @@ class ITMMomentumStrategy:
             "sl": ltp - self.sl_points,
             "target": ltp + self.target_points,
             "qty": qty,
+            "highest_ltp": ltp,
         }
         # Clear ALL setups on entry
         self.active_pe_setup = None
@@ -312,7 +336,8 @@ class ITMMomentumStrategy:
         contract = pos['contract']
         pnl = (ltp - pos['entry_price']) * pos['qty']
         
-        log.info(f"{Fore.MAGENTA}*** EXIT TRIGGERED ({reason}) *** {contract.symbol} @ {ltp} | PNL: {pnl:.2f}{Style.RESET_ALL}")
+        exit_time_str = datetime.now().strftime("%H:%M:%S")
+        log.info(f"{Fore.MAGENTA}*** EXIT TRIGGERED ({reason}) at {exit_time_str} *** {contract.symbol} @ {ltp} | PNL: {pnl:.2f}{Style.RESET_ALL}")
         
         if not self.simulate_orders:
             try:
@@ -322,6 +347,7 @@ class ITMMomentumStrategy:
 
         self.closed_pnl += pnl
         self.in_position = False
+        self.last_exit_time = datetime.now()
         self.position_info = {}
         # Reset subscribed tokens to just Spot to save bandwidth/confusion
         self.subscribed_tokens = {self.index_token}
@@ -331,15 +357,38 @@ class ITMMomentumStrategy:
         # Check for dynamic config updates
         if self._load_config() and self.in_position:
             entry = self.position_info['entry_price']
-            self.position_info['sl'] = entry - self.sl_points
             self.position_info['target'] = entry + self.target_points
+            
+            # Recalculate SL based on new config and current high
+            highest = self.position_info.get('highest_ltp', entry)
+            peak_pts = highest - entry
+            
+            new_sl = entry - self.sl_points # Base SL
+            
+            if peak_pts >= self.trailing_activation_points:
+                trail_sl = highest - self.trailing_distance_points
+                new_sl = max(new_sl, trail_sl)
+            
+            self.position_info['sl'] = new_sl
             log.info(f"Position Limits Updated: Target {self.position_info['target']:.2f} | SL {self.position_info['sl']:.2f}")
+        
+        # Check for discard requests (regardless of position state, but mostly for armed setups)
+        if self.current_ce_setup_discard and self.active_ce_setup:
+            log.warning(f"{Fore.YELLOW}CONFIG REQUEST: Discarding active CE setup {self.active_ce_setup['contract'].symbol} as requested.{Style.RESET_ALL}")
+            self.active_ce_setup = None
+            self._save_state()
+
+        if self.current_pe_setup_discard and self.active_pe_setup:
+            log.warning(f"{Fore.YELLOW}CONFIG REQUEST: Discarding active PE setup {self.active_pe_setup['contract'].symbol} as requested.{Style.RESET_ALL}")
+            self.active_pe_setup = None
+            self._save_state()
 
         now = datetime.now()
         
         # 1. Check Time Window (9:15 - 10:00)
-        # If outside window and not in position, do nothing or just monitor
-        if not (dt_time(9, 15) <= now.time() <= dt_time(10, 00)) and not self.in_position:
+        # If outside window and not in position AND no active setups, do nothing
+        has_active_setups = (self.active_pe_setup is not None) or (self.active_ce_setup is not None)
+        if not (dt_time(9, 15) <= now.time() <= dt_time(10, 00)) and not self.in_position and not has_active_setups:
             return
 
         # 2. Minute-based Candle Check (Only runs once per minute)
@@ -354,8 +403,11 @@ class ITMMomentumStrategy:
             spot_ltp = self.latest_ltp.get(self.index_token)
             
             # Check both setups independently
-            for setup in [self.active_pe_setup, self.active_ce_setup]:
-                if not setup: continue
+            setups_to_check = []
+            if self.active_pe_setup and self.pe_setup_allowed: setups_to_check.append(self.active_pe_setup)
+            if self.active_ce_setup and self.ce_setup_allowed: setups_to_check.append(self.active_ce_setup)
+
+            for setup in setups_to_check:
                 
                 opt_ltp = self.latest_ltp.get(setup['contract'].token)
                 if spot_ltp and opt_ltp:
@@ -379,6 +431,20 @@ class ITMMomentumStrategy:
         if self.in_position:
             pos = self.position_info
             if token == pos['contract'].token:
+                # Update Highest LTP
+                if ltp > pos.get('highest_ltp', pos['entry_price']):
+                    pos['highest_ltp'] = ltp
+                    peak_mtm = (ltp - pos['entry_price']) * pos['qty']
+                    log.info(f"{Fore.CYAN}Peak MTM Updated: {peak_mtm:.2f} (LTP: {ltp}){Style.RESET_ALL}")
+                
+                # Trailing SL Logic
+                peak_pts = pos['highest_ltp'] - pos['entry_price']
+                if peak_pts >= self.trailing_activation_points:
+                    new_sl = pos['highest_ltp'] - self.trailing_distance_points
+                    if new_sl > pos['sl']:
+                        pos['sl'] = new_sl
+                        log.info(f"{Fore.MAGENTA}Trailing SL Updated: {new_sl:.2f} (Peak Pts: {peak_pts:.2f}){Style.RESET_ALL}")
+
                 current_pnl = (ltp - pos['entry_price']) * pos['qty']
                 pnl_color = Fore.GREEN if current_pnl >= 0 else Fore.RED
                 log.info(f"Position Monitor: {pos['contract'].symbol} LTP: {ltp} | PnL: {pnl_color}{current_pnl:.2f}{Style.RESET_ALL}")

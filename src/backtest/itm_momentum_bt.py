@@ -13,6 +13,9 @@ Usage:
 
 import argparse
 import logging
+import math
+import yaml
+from pathlib import Path
 import pandas as pd
 import time
 from datetime import datetime, date, timedelta, time as dt_time
@@ -47,14 +50,35 @@ class ITMMomentumBacktest:
         self.api.login()
         time.sleep(1)
         
+        # Load Config
+        self.config_file = Path("config/itm_momentum.yaml")
+        self.sl_points = 10
+        self.target_points = 15
+        self.trailing_activation_points = 10
+        self.trailing_distance_points = 10
+        self._load_config()
+        
         self.results = []
 
+    def _load_config(self):
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, "r") as f:
+                    config = yaml.safe_load(f)
+                
+                idx_config = config.get(self.index_name, {})
+                self.sl_points = idx_config.get("sl_points", 10)
+                self.target_points = idx_config.get("target_points", 15)
+                self.trailing_activation_points = idx_config.get("trailing_activation_points", 10)
+                self.trailing_distance_points = idx_config.get("trailing_distance_points", 10)
+                log.info(f"Config Loaded: SL={self.sl_points}, Target={self.target_points}, TrailAct={self.trailing_activation_points}, TrailDist={self.trailing_distance_points}")
+            except Exception as e:
+                log.error(f"Error loading config: {e}")
+
     def _get_itm_strike(self, spot: float, option_type: str) -> int:
-        atm = round(spot / self.strike_step) * self.strike_step
         if option_type == "CE":
-            return atm - self.strike_step
-        else:
-            return atm + self.strike_step
+            return int(math.floor(spot / self.strike_step) * self.strike_step)
+        return int(math.ceil(spot / self.strike_step) * self.strike_step)
 
     def _fetch_candles(self, token, exchange, date_obj, start_time_str="09:15", end_time_str="15:30"):
         time.sleep(1)
@@ -161,7 +185,7 @@ class ITMMomentumBacktest:
                             log.info(f"  Continuation of Green leg. Ignoring update.")
 
                     if not is_continuation:
-                        strike = self._get_itm_strike(c3.close, "PE")
+                        strike = self._get_itm_strike(c1.low, "PE")
                         try:
                             contract = find_option(self.index_name, strike, "PE", expiry, trading_date)
                             # Fetch Option Candle for Ref Time (C1)
@@ -188,7 +212,7 @@ class ITMMomentumBacktest:
                             log.info(f"  Continuation of Red leg. Ignoring update.")
 
                     if not is_continuation:
-                        strike = self._get_itm_strike(c3.close, "CE")
+                        strike = self._get_itm_strike(c1.high, "CE")
                         try:
                             contract = find_option(self.index_name, strike, "CE", expiry, trading_date)
                             opt_df = self._fetch_candles(contract.token, contract.exchange, trading_date,
@@ -246,8 +270,8 @@ class ITMMomentumBacktest:
                     log.info(f"  Spot Trigger Fail: {spot_candle.low if setup['type']=='PE' else spot_candle.high} vs {setup['spot_trigger']}")
 
     def _simulate_trade(self, contract, entry_price, entry_time, trading_date):
-        sl = entry_price - 10
-        target = entry_price + 15
+        sl = entry_price - self.sl_points
+        target = entry_price + self.target_points
         
         # Fetch remaining data for the day for this option
         full_opt_df = self._fetch_candles(contract.token, contract.exchange, trading_date, 
@@ -271,10 +295,6 @@ class ITMMomentumBacktest:
         
         # Iterate subsequent candles
         for ts, row in rest_of_day_df.iterrows():
-            # Update highest price seen so far (for SL/EOD cases)
-            if row.high > highest_price_during_trade:
-                highest_price_during_trade = row.high
-
             # 1. Check Exit against SL (Conservative: Check Low first)
             if row.low <= sl:
                 exit_price = sl
@@ -307,6 +327,16 @@ class ITMMomentumBacktest:
                             break
                     max_potential_profit = peak_price - entry_price
                 break
+            
+            # 3. Update High and Trailing SL for NEXT candle
+            if row.high > highest_price_during_trade:
+                highest_price_during_trade = row.high
+                
+                peak_pts = highest_price_during_trade - entry_price
+                if peak_pts >= self.trailing_activation_points:
+                    trail_sl = highest_price_during_trade - self.trailing_distance_points
+                    if trail_sl > sl:
+                        sl = trail_sl
         
         if exit_time is None:
             # EOD Exit
