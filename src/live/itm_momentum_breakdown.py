@@ -84,6 +84,7 @@ class ITMMomentumStrategy:
         self.pe_setup_allowed = True
         self.current_ce_setup_discard = False
         self.current_pe_setup_discard = False
+        self.allowed_trading_hours = {h: True for h in range(9, 15)}
         self._load_config()
 
         # State Variables
@@ -130,14 +131,27 @@ class ITMMomentumStrategy:
                     self.pe_setup_allowed = idx_config.get("pe_setup_allowed", self.pe_setup_allowed)
                     self.current_ce_setup_discard = idx_config.get("current_ce_setup_discard", False)
                     self.current_pe_setup_discard = idx_config.get("current_pe_setup_discard", False)
+                    self.allowed_trading_hours = idx_config.get("allowed_trading_hours", self.allowed_trading_hours)
                     
                     self.quantity = self.lot_size * self.num_lots
                     self.last_config_mtime = mtime
-                    log.info(f"Config Loaded: Qty={self.quantity}, SL={self.sl_points}, Target={self.target_points}, TrailAct={self.trailing_activation_points}, TrailDist={self.trailing_distance_points}")
+                    log.info(f"Config Loaded: Qty={self.quantity}, SL={self.sl_points}, Target={self.target_points}, AllowedHours={list(self.allowed_trading_hours.keys())}")
                     updated = True
             except Exception as e:
                 log.error(f"Error loading config: {e}")
         return updated
+
+    def _is_trading_allowed(self, t: dt_time) -> bool:
+        """Checks if the current time falls into an allowed trading hour slot."""
+        # Slot logic: 9:15-10:15 is slot 9, 10:15-11:15 is slot 10, etc.
+        # If minute >= 15, slot = hour. Else slot = hour - 1.
+        slot = t.hour if t.minute >= 15 else t.hour - 1
+        
+        # Valid slots are 9 to 14 (covering 09:15 to 15:15)
+        if slot < 9 or slot > 14:
+            return False
+            
+        return self.allowed_trading_hours.get(slot, False)
 
     def _get_itm_strike(self, spot: float, option_type: str) -> int:
         """
@@ -385,16 +399,16 @@ class ITMMomentumStrategy:
 
         now = datetime.now()
         
-        # 1. Check Time Window (9:15 - 10:00)
-        # If outside window and not in position AND no active setups, do nothing
+        # 1. Check Time Window (Configurable Hourly Slots)
+        # If outside allowed hours and not in position AND no active setups, stop processing (no new scans)
         has_active_setups = (self.active_pe_setup is not None) or (self.active_ce_setup is not None)
-        if not (dt_time(9, 15) <= now.time() <= dt_time(10, 00)) and not self.in_position and not has_active_setups:
+        if not self._is_trading_allowed(now.time()) and not self.in_position and not has_active_setups:
             return
 
         # 2. Minute-based Candle Check (Only runs once per minute)
         if now.minute != self.last_candle_check_minute:
             # Only look for new setups if we are NOT in a position
-            if not self.in_position and dt_time(9, 15) <= now.time() <= dt_time(10, 00):
+            if not self.in_position and self._is_trading_allowed(now.time()):
                 self._check_for_setup()
             self.last_candle_check_minute = now.minute
 

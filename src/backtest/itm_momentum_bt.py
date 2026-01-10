@@ -56,6 +56,13 @@ class ITMMomentumBacktest:
         self.target_points = 15
         self.trailing_activation_points = 10
         self.trailing_distance_points = 10
+        self.lot_size = 65 if self.index_name == "NIFTY" else 20
+        self.num_lots = 1
+        self.ce_setup_allowed = True
+        self.pe_setup_allowed = True
+        self.current_ce_setup_discard = False
+        self.current_pe_setup_discard = False
+        self.allowed_trading_hours = {h: True for h in range(9, 15)}
         self._load_config()
         
         self.results = []
@@ -71,7 +78,15 @@ class ITMMomentumBacktest:
                 self.target_points = idx_config.get("target_points", 15)
                 self.trailing_activation_points = idx_config.get("trailing_activation_points", 10)
                 self.trailing_distance_points = idx_config.get("trailing_distance_points", 10)
-                log.info(f"Config Loaded: SL={self.sl_points}, Target={self.target_points}, TrailAct={self.trailing_activation_points}, TrailDist={self.trailing_distance_points}")
+                self.lot_size = idx_config.get("lot_size", self.lot_size)
+                self.num_lots = idx_config.get("num_lots", self.num_lots)
+                self.ce_setup_allowed = idx_config.get("ce_setup_allowed", True)
+                self.pe_setup_allowed = idx_config.get("pe_setup_allowed", True)
+                self.current_ce_setup_discard = idx_config.get("current_ce_setup_discard", False)
+                self.current_pe_setup_discard = idx_config.get("current_pe_setup_discard", False)
+                self.allowed_trading_hours = idx_config.get("allowed_trading_hours", self.allowed_trading_hours)
+
+                log.info(f"Config Loaded: SL={self.sl_points}, Target={self.target_points}, AllowedHours={list(self.allowed_trading_hours.keys())}")
             except Exception as e:
                 log.error(f"Error loading config: {e}")
 
@@ -102,15 +117,64 @@ class ITMMomentumBacktest:
             log.error(f"Error fetching candles: {e}")
             return pd.DataFrame()
 
+    def _is_trading_allowed(self, t: dt_time) -> bool:
+        # Slot logic: 9:15-10:15 is slot 9, etc.
+        slot = t.hour if t.minute >= 15 else t.hour - 1
+        if slot < 9 or slot > 14:
+            return False
+        return self.allowed_trading_hours.get(slot, False)
+
     def run(self, start_date: date, end_date: date):
+        # Create output directory for this run
+        output_dir = Path("data/backtest/momentum_buying")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log.info(f"Saving results to {output_dir}")
+
+        daily_stats = []
         current_date = start_date
+        
         while current_date <= end_date:
             if current_date.weekday() < 5: # Skip weekends
                 log.info(f"{Fore.CYAN}Processing {current_date}...{Style.RESET_ALL}")
+                
+                # Reset results for the day
+                self.results = []
+                
                 self._process_day(current_date)
+                
+                if self.results:
+                    df = pd.DataFrame(self.results)
+                    # Save daily CSV
+                    csv_file = output_dir / f"trades_{self.index_name}_{current_date}.csv"
+                    df.to_csv(csv_file, index=False)
+                    
+                    # Calculate Daily Stats
+                    pnl_points = df['pnl'].sum()
+                    trades = len(df)
+                    wins = len(df[df['pnl'] > 0])
+                    losses = len(df[df['pnl'] <= 0])
+                    
+                    quantity = self.lot_size * self.num_lots
+                    gross_pnl = pnl_points * quantity
+                    brokerage = trades * 40 # Approx 20 buy + 20 sell
+                    net_pnl = gross_pnl - brokerage
+
+                    daily_stats.append({
+                        "Date": current_date,
+                        "PnL(Pts)": pnl_points,
+                        "Gross PnL": gross_pnl,
+                        "Brokerage": brokerage,
+                        "Net PnL": net_pnl,
+                        "Trades": trades,
+                        "Wins": wins,
+                        "Losses": losses,
+                        "AvgMaxPotProfit": df['max_potential_profit'].mean() if 'max_potential_profit' in df else 0.0,
+                        "AvgMaxPotLoss": df['max_potential_loss'].mean() if 'max_potential_loss' in df else 0.0
+                    })
+            
             current_date += timedelta(days=1)
         
-        self._save_results()
+        self._print_summary(daily_stats, output_dir)
 
     def _process_day(self, trading_date: date):
         # 1. Fetch Spot Data
@@ -129,10 +193,10 @@ class ITMMomentumBacktest:
         active_ce_setup = None
         last_exit_time = None
         
-        # Iterate minutes from 09:18 to 10:00 for setup detection
+        # Iterate minutes from 09:18 to 15:15 for setup detection
         # We need at least 3 previous candles (15, 16, 17) to check at 18
         start_time = datetime.combine(trading_date, dt_time(9, 18))
-        end_scan_time = datetime.combine(trading_date, dt_time(10, 0))
+        end_scan_time = datetime.combine(trading_date, dt_time(15, 15))
         
         # Get all timestamps in the scan window
         scan_times = [t for t in spot_df.index if start_time <= t <= end_scan_time]
@@ -141,6 +205,10 @@ class ITMMomentumBacktest:
             # Skip scanning if we are currently in a trade
             if last_exit_time and current_ts <= last_exit_time:
                 log.info(f"Skipping {current_ts.time()} (Trade active/just finished until {last_exit_time.time()})")
+                continue
+            
+            # Check if trading is allowed in this hour slot
+            if not self._is_trading_allowed(current_ts.time()):
                 continue
 
             # --- 1. Check for Pattern (using previous 3 candles) ---
@@ -153,6 +221,14 @@ class ITMMomentumBacktest:
             c2_ts = current_ts - timedelta(minutes=2)
             c1_ts = current_ts - timedelta(minutes=3)
             c0_ts = current_ts - timedelta(minutes=4)
+
+            # Check for discard requests
+            if self.current_pe_setup_discard and active_pe_setup:
+                log.info(f"Scan {current_ts.time()} | Discarding active PE setup due to config.")
+                active_pe_setup = None
+            if self.current_ce_setup_discard and active_ce_setup:
+                log.info(f"Scan {current_ts.time()} | Discarding active CE setup due to config.")
+                active_ce_setup = None
 
             if active_pe_setup:
                 log.info(f"Scan {current_ts.time()} | Active PE Setup pending trigger...")
@@ -176,7 +252,7 @@ class ITMMomentumBacktest:
                 log.info(f"Scan {current_ts.time()} | Candles: {c1_ts.time()}{fmt_c(c1)} {c2_ts.time()}{fmt_c(c2)} {c3_ts.time()}{fmt_c(c3)}")
 
                 # Put Setup: 3 Green
-                if c1.close > c1.open and c2.close > c2.open and c3.close > c3.open:
+                if self.pe_setup_allowed and c1.close > c1.open and c2.close > c2.open and c3.close > c3.open:
                     is_continuation = False
                     if active_pe_setup:
                         # If previous candle was also Green, it's a continuation. Keep original setup.
@@ -203,7 +279,7 @@ class ITMMomentumBacktest:
                             log.warning(f"  Could not setup PE: {e}")
 
                 # Call Setup: 3 Red
-                elif c1.close < c1.open and c2.close < c2.open and c3.close < c3.open:
+                elif self.ce_setup_allowed and c1.close < c1.open and c2.close < c2.open and c3.close < c3.open:
                     is_continuation = False
                     if active_ce_setup:
                         # If previous candle was also Red, it's a continuation. Keep original setup.
@@ -367,34 +443,42 @@ class ITMMomentumBacktest:
         })
         return exit_time
 
-    def _save_results(self):
-        if not self.results:
-            log.info("No trades generated.")
+    def _print_summary(self, daily_stats, output_dir):
+        if not daily_stats:
+            log.info("No trades generated during the period.")
             return
-            
-        df = pd.DataFrame(self.results)
-        print("\n" + "="*50)
-        print("BACKTEST RESULTS")
-        print("="*50)
-        print(df)
+
+        summary_df = pd.DataFrame(daily_stats)
         
-        total_pnl = df['pnl'].sum()
-        wins = len(df[df['pnl'] > 0])
-        losses = len(df[df['pnl'] <= 0])
-        win_rate = (wins / len(df)) * 100 if len(df) > 0 else 0
+        print("\n" + "="*80)
+        print("DAY-WISE SUMMARY")
+        print("="*80)
+        print(summary_df.to_string(index=False, float_format="%.2f"))
         
-        print("-" * 30)
-        print(f"Total Trades: {len(df)}")
-        print(f"Total PnL:    {total_pnl:.2f}")
-        print(f"Win Rate:     {win_rate:.1f}% ({wins}W / {losses}L)")
-        if not df.empty:
-            print(f"Avg Max Pot Profit: {df['max_potential_profit'].mean():.2f}")
-            print(f"Avg Max Pot Loss:   {df['max_potential_loss'].mean():.2f}")
-        print("="*50)
+        total_pnl_points = summary_df['PnL(Pts)'].sum()
+        total_gross = summary_df['Gross PnL'].sum()
+        total_brokerage = summary_df['Brokerage'].sum()
+        total_net = summary_df['Net PnL'].sum()
+
+        total_trades = summary_df['Trades'].sum()
+        total_wins = summary_df['Wins'].sum()
+        total_losses = summary_df['Losses'].sum()
+        win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
         
-        filename = f"backtest_itm_{self.index_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        df.to_csv(filename, index=False)
-        log.info(f"Results saved to {filename}")
+        print("-" * 80)
+        print(f"OVERALL TOTALS")
+        print(f"Total PnL (Pts): {total_pnl_points:.2f}")
+        print(f"Gross PnL:       {total_gross:.2f}")
+        print(f"Total Brokerage: {total_brokerage:.2f}")
+        print(f"Net PnL:         {total_net:.2f}")
+        print(f"Total Trades: {total_trades}")
+        print(f"Win Rate:     {win_rate:.1f}% ({total_wins}W / {total_losses}L)")
+        print("="*80)
+        
+        # Save summary CSV
+        summary_file = output_dir / f"summary_report_{self.index_name}.csv"
+        summary_df.to_csv(summary_file, index=False)
+        log.info(f"Summary report saved to {summary_file}")
 
 def main():
     parser = argparse.ArgumentParser()
