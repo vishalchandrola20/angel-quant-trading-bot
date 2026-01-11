@@ -24,6 +24,7 @@ from colorama import Fore, Style, init as colorama_init
 
 from src.api.smartapi_client import AngelAPI
 from src.market.contracts import find_option, OptionContract, get_next_expiry
+from src.utils.telegram_bot import TelegramBot
 
 # Initialize colorama
 colorama_init(autoreset=True)
@@ -97,10 +98,12 @@ class ITMMomentumStrategy:
         self.position_info: Dict[str, Any] = {}
         self.closed_pnl = 0.0
         self.last_exit_time: datetime | None = None
+        self.is_paused = False # Controls whether we scan for new trades
         
         self.ws = None
         self.subscribed_tokens = {self.index_token} # Always subscribe to Spot
 
+        self.telegram: TelegramBot | None = None
         log.info(f"{Fore.CYAN}Strategy Initialized: {self.index_name} | Expiry: {self.expiry} | Mode: {'SIMULATION' if simulate_orders else 'LIVE'}{Style.RESET_ALL}")
 
     def _load_config(self) -> bool:
@@ -133,6 +136,39 @@ class ITMMomentumStrategy:
                     self.current_pe_setup_discard = idx_config.get("current_pe_setup_discard", False)
                     self.allowed_trading_hours = idx_config.get("allowed_trading_hours", self.allowed_trading_hours)
                     
+                    # Load Telegram Config
+                    creds_file = Path("config/credentials.yaml")
+                    cred_token = ""
+                    cred_chat = ""
+                    
+                    if creds_file.exists():
+                        try:
+                            with open(creds_file, "r") as cf:
+                                creds = yaml.safe_load(cf) or {}
+                                tg_creds = creds.get("TELEGRAM", {})
+                                cred_token = tg_creds.get("bot_token", "")
+                                cred_chat = str(tg_creds.get("chat_id", ""))
+                        except Exception as e:
+                            log.error(f"Error loading credentials: {e}")
+
+                    tg_conf = config.get("TELEGRAM", {})
+                    tg_token = cred_token or tg_conf.get("bot_token", "")
+                    tg_chat = cred_chat or str(tg_conf.get("chat_id", ""))
+                    tg_enabled = tg_conf.get("enabled", False)
+                    
+                    # Only recreate bot if credentials changed to avoid killing the listener
+                    if self.telegram:
+                        if self.telegram.bot_token != tg_token or self.telegram.chat_id != tg_chat:
+                            self.telegram.stop_listening()
+                            self.telegram = TelegramBot(tg_token, tg_chat, tg_enabled)
+                            # If strategy is already running, restart listener
+                            if self.ws: 
+                                self.telegram.start_listening(self._handle_telegram_command)
+                        else:
+                            self.telegram.enabled = tg_enabled
+                    else:
+                        self.telegram = TelegramBot(tg_token, tg_chat, tg_enabled)
+
                     self.quantity = self.lot_size * self.num_lots
                     self.last_config_mtime = mtime
                     log.info(f"Config Loaded: Qty={self.quantity}, SL={self.sl_points}, Target={self.target_points}, AllowedHours={list(self.allowed_trading_hours.keys())}")
@@ -152,6 +188,27 @@ class ITMMomentumStrategy:
             return False
             
         return self.allowed_trading_hours.get(slot, False)
+
+    def _handle_telegram_command(self, command: str):
+        """Callback for Telegram commands."""
+        cmd = command.lower()
+        if cmd == "/stop":
+            self.is_paused = True
+            msg = "🛑 <b>Strategy PAUSED</b>\nNo new setups will be scanned or triggered.\nExisting positions will be managed."
+            log.warning("Telegram command received: STOP")
+            if self.telegram: self.telegram.send_message(msg)
+        
+        elif cmd == "/start":
+            self.is_paused = False
+            msg = "✅ <b>Strategy RESUMED</b>\nScanning for new setups..."
+            log.info("Telegram command received: START")
+            if self.telegram: self.telegram.send_message(msg)
+            
+        elif cmd == "/status":
+            status = "🔴 PAUSED" if self.is_paused else "🟢 RUNNING"
+            pos_status = f"In Position ({self.position_info.get('contract', {}).get('symbol', '')})" if self.in_position else "Scanning"
+            msg = f"ℹ️ <b>STATUS REPORT</b>\nState: {status}\nActivity: {pos_status}\nClosed PnL: {self.closed_pnl:.2f}"
+            if self.telegram: self.telegram.send_message(msg)
 
     def _get_itm_strike(self, spot: float, option_type: str) -> int:
         """
@@ -298,6 +355,14 @@ class ITMMomentumStrategy:
             f"Spot Trigger: Break {'Below' if setup_type=='PE' else 'Above'} {spot_trigger} | "
             f"Option Trigger: Break Above {opt_high}{Style.RESET_ALL}"
         )
+        
+        if self.telegram:
+            msg = f"⚠️ <b>SETUP ARMED ({setup_type})</b>\n" \
+                  f"Symbol: {contract.symbol}\n" \
+                  f"Spot Trigger: {spot_trigger}\n" \
+                  f"Opt Trigger: {opt_high}\n" \
+                  f"Time: {setup_time_str}"
+            self.telegram.send_message(msg)
 
     def _subscribe_to_token(self, token: str):
         if token not in self.subscribed_tokens:
@@ -344,6 +409,14 @@ class ITMMomentumStrategy:
         self.active_pe_setup = None
         self.active_ce_setup = None
         log.info(f"Position Active: Target {self.position_info['target']:.2f} | SL {self.position_info['sl']:.2f}")
+        
+        if self.telegram:
+            msg = f"🚀 <b>ENTRY TRIGGERED</b>\n" \
+                  f"Symbol: {contract.symbol}\n" \
+                  f"Price: {ltp}\n" \
+                  f"Target: {self.position_info['target']:.2f}\n" \
+                  f"SL: {self.position_info['sl']:.2f}"
+            self.telegram.send_message(msg)
 
     def _execute_exit(self, ltp: float, reason: str):
         pos = self.position_info
@@ -366,6 +439,14 @@ class ITMMomentumStrategy:
         # Reset subscribed tokens to just Spot to save bandwidth/confusion
         self.subscribed_tokens = {self.index_token}
         # Note: In a robust system, we would unsubscribe from the option token here.
+
+        if self.telegram:
+            emoji = "✅" if pnl >= 0 else "❌"
+            msg = f"{emoji} <b>EXIT TRIGGERED ({reason})</b>\n" \
+                  f"Symbol: {contract.symbol}\n" \
+                  f"Exit Price: {ltp}\n" \
+                  f"PnL: {pnl:.2f}"
+            self.telegram.send_message(msg)
 
     def _process_tick(self, token: str, ltp: float):
         # Check for dynamic config updates
@@ -408,12 +489,15 @@ class ITMMomentumStrategy:
         # 2. Minute-based Candle Check (Only runs once per minute)
         if now.minute != self.last_candle_check_minute:
             # Only look for new setups if we are NOT in a position
-            if not self.in_position and self._is_trading_allowed(now.time()):
+            if not self.in_position and not self.is_paused and self._is_trading_allowed(now.time()):
                 self._check_for_setup()
             self.last_candle_check_minute = now.minute
 
         # 3. Check Triggers (If Setup Active)
         if not self.in_position:
+            if self.is_paused:
+                return # Skip trigger checks if paused
+
             spot_ltp = self.latest_ltp.get(self.index_token)
             
             # Check both setups independently
@@ -505,27 +589,60 @@ class ITMMomentumStrategy:
             log.info(f"Waiting {wait_s:.0f}s for market open (9:15)...")
             time_module.sleep(wait_s)
 
-        try:
-            self.ws = SmartWebSocketV2(self.api.jwt_token, self.api.api_key, self.api.client_id, self.api.feed_token)
-            
-            def on_open(wsapp):
-                log.info("WebSocket Connected. Subscribing to Spot...")
-                # Initial subscription to Spot Index
-                req = [{"exchangeType": 1 if self.index_name=="NIFTY" else 3, "tokens": [self.index_token]}]
-                self.ws.subscribe("itm_init", 3, req)
+        if self.telegram:
+            self.telegram.start_listening(self._handle_telegram_command)
 
-            self.ws.on_open = on_open
-            self.ws.on_data = self._on_ws_message
-            self.ws.on_error = lambda ws, err: log.error(f"WS Error: {err}")
-            self.ws.connect()
-            
-        except KeyboardInterrupt:
-            log.info("Stopped by user.")
-        except Exception as e:
-            log.exception(f"Fatal Error: {e}")
-        finally:
-            if self.ws and self.ws.wsapp:
-                self.ws.wsapp.close()
+        # --- Main Reconnection Loop ---
+        while True:
+            try:
+                if SmartWebSocketV2 is None:
+                    log.error("SmartWebSocketV2 library not available. Exiting.")
+                    break
+
+                log.info("Connecting to WebSocket...")
+                self.ws = SmartWebSocketV2(self.api.jwt_token, self.api.api_key, self.api.client_id, self.api.feed_token)
+                
+                def on_open(wsapp):
+                    log.info("WebSocket Connected. Resubscribing to tracked tokens...")
+                    # Subscribe to ALL tokens currently in the set (Spot + Active Options)
+                    spot_tokens = [t for t in self.subscribed_tokens if t == self.index_token]
+                    opt_tokens = [t for t in self.subscribed_tokens if t != self.index_token]
+                    
+                    req_list = []
+                    if spot_tokens:
+                        req_list.append({"exchangeType": 1 if self.index_name=="NIFTY" else 3, "tokens": spot_tokens})
+                    if opt_tokens:
+                        req_list.append({"exchangeType": 2 if self.index_name=="NIFTY" else 4, "tokens": opt_tokens})
+                    
+                    if req_list:
+                        self.ws.subscribe("itm_resume", 3, req_list)
+
+                self.ws.on_open = on_open
+                self.ws.on_data = self._on_ws_message
+                self.ws.on_error = lambda ws, err: log.error(f"WS Error: {err}")
+                self.ws.connect()
+                
+                # If connect() returns, it means the connection closed cleanly or dropped
+                log.warning("WebSocket connection dropped. Reconnecting in 5 seconds...")
+                time_module.sleep(5)
+                
+            except KeyboardInterrupt:
+                log.info("Stopped by user (Ctrl+C). Exiting loop.")
+                break # <--- This ensures Ctrl+C kills the script immediately
+            except Exception as e:
+                log.error(f"Connection Error: {e}. Retrying in 10 seconds...")
+                time_module.sleep(10)
+            finally:
+                # Clean up old websocket object before retrying
+                if self.ws and hasattr(self.ws, 'wsapp') and self.ws.wsapp:
+                    try:
+                        self.ws.wsapp.close()
+                    except Exception:
+                        pass
+
+        # Cleanup after loop exit (User stopped)
+        if self.telegram:
+            self.telegram.stop_listening()
 
 def main():
     parser = argparse.ArgumentParser()
