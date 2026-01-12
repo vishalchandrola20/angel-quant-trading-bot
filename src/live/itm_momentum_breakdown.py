@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import csv
 import time as time_module
 import json
 import yaml
@@ -19,6 +20,7 @@ import os
 from datetime import datetime, date, time as dt_time, timedelta
 from pathlib import Path
 from typing import Dict, Any, List
+from dataclasses import asdict
 
 from colorama import Fore, Style, init as colorama_init
 
@@ -79,13 +81,14 @@ class ITMMomentumStrategy:
         self.last_config_mtime = 0
         self.sl_points = 10
         self.target_points = 15
-        self.trailing_activation_points = 10
-        self.trailing_distance_points = 10
+        self.trailing_sl_tiers = []
         self.ce_setup_allowed = True
         self.pe_setup_allowed = True
         self.current_ce_setup_discard = False
         self.current_pe_setup_discard = False
         self.allowed_trading_hours = {h: True for h in range(9, 15)}
+        self.telegram: TelegramBot | None = None
+        self.ws = None
         self._load_config()
 
         # State Variables
@@ -99,12 +102,22 @@ class ITMMomentumStrategy:
         self.closed_pnl = 0.0
         self.last_exit_time: datetime | None = None
         self.is_paused = False # Controls whether we scan for new trades
+        self.max_daily_loss = 1500
         
-        self.ws = None
+        # State Persistence
+        self.state_dir = Path("data/state")
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        
         self.subscribed_tokens = {self.index_token} # Always subscribe to Spot
 
-        self.telegram: TelegramBot | None = None
         log.info(f"{Fore.CYAN}Strategy Initialized: {self.index_name} | Expiry: {self.expiry} | Mode: {'SIMULATION' if simulate_orders else 'LIVE'}{Style.RESET_ALL}")
+
+        # Try to resume state
+        self._load_state()
+
+        if self.telegram:
+            mode = "SIMULATION" if simulate_orders else "LIVE"
+            self.telegram.send_message(f"🤖 <b>Bot Started</b>\nIndex: {self.index_name}\nMode: {mode}")
 
     def _load_config(self) -> bool:
         updated = False
@@ -128,8 +141,14 @@ class ITMMomentumStrategy:
                     self.num_lots = idx_config.get("num_lots", self.num_lots)
                     self.sl_points = idx_config.get("sl_points", self.sl_points)
                     self.target_points = idx_config.get("target_points", self.target_points)
-                    self.trailing_activation_points = idx_config.get("trailing_activation_points", self.trailing_activation_points)
-                    self.trailing_distance_points = idx_config.get("trailing_distance_points", self.trailing_distance_points)
+                    self.max_daily_loss = idx_config.get("max_daily_loss", 1500)
+                    
+                    self.trailing_sl_tiers = idx_config.get("trailing_sl_tiers", [])
+                    if not self.trailing_sl_tiers:
+                        act = idx_config.get("trailing_activation_points", 10)
+                        dist = idx_config.get("trailing_distance_points", 10)
+                        self.trailing_sl_tiers = [{"activation": act, "distance": dist}]
+
                     self.ce_setup_allowed = idx_config.get("ce_setup_allowed", self.ce_setup_allowed)
                     self.pe_setup_allowed = idx_config.get("pe_setup_allowed", self.pe_setup_allowed)
                     self.current_ce_setup_discard = idx_config.get("current_ce_setup_discard", False)
@@ -138,23 +157,31 @@ class ITMMomentumStrategy:
                     
                     # Load Telegram Config
                     creds_file = Path("config/credentials.yaml")
-                    cred_token = ""
-                    cred_chat = ""
+                    tg_token = ""
+                    tg_chat = ""
+                    tg_enabled = False
                     
                     if creds_file.exists():
+                        log.info(f"Found credentials file: {creds_file}")
                         try:
                             with open(creds_file, "r") as cf:
                                 creds = yaml.safe_load(cf) or {}
                                 tg_creds = creds.get("TELEGRAM", {})
-                                cred_token = tg_creds.get("bot_token", "")
-                                cred_chat = str(tg_creds.get("chat_id", ""))
+                                tg_token = tg_creds.get("bot_token", "")
+                                tg_chat = str(tg_creds.get("chat_id", ""))
+                                tg_enabled = tg_creds.get("enabled", False)
                         except Exception as e:
                             log.error(f"Error loading credentials: {e}")
-
-                    tg_conf = config.get("TELEGRAM", {})
-                    tg_token = cred_token or tg_conf.get("bot_token", "")
-                    tg_chat = cred_chat or str(tg_conf.get("chat_id", ""))
-                    tg_enabled = tg_conf.get("enabled", False)
+                    else:
+                        log.warning(f"Credentials file not found: {creds_file}")
+                    
+                    if tg_enabled:
+                        if not tg_token or not tg_chat:
+                            log.warning(f"⚠️ Telegram enabled but credentials missing! Token found: {bool(tg_token)}, ChatID found: {bool(tg_chat)}")
+                        else:
+                            log.info(f"✅ Telegram Alerts Enabled. Chat ID: {tg_chat}")
+                    else:
+                        log.info("ℹ️ Telegram Alerts are DISABLED in credentials.yaml.")
                     
                     # Only recreate bot if credentials changed to avoid killing the listener
                     if self.telegram:
@@ -172,10 +199,99 @@ class ITMMomentumStrategy:
                     self.quantity = self.lot_size * self.num_lots
                     self.last_config_mtime = mtime
                     log.info(f"Config Loaded: Qty={self.quantity}, SL={self.sl_points}, Target={self.target_points}, AllowedHours={list(self.allowed_trading_hours.keys())}")
+                    
+                    if self.telegram:
+                        self.telegram.send_message(
+                            f"⚙️ <b>Config Loaded ({self.trading_date})</b>\n"
+                            f"SL: {self.sl_points} | Target: {self.target_points}\n"
+                            f"Qty: {self.quantity} | Max Loss: {self.max_daily_loss}"
+                        )
                     updated = True
             except Exception as e:
                 log.error(f"Error loading config: {e}")
         return updated
+
+    def _get_state_file(self) -> Path:
+        return self.state_dir / f"itm_state_{self.index_name}_{self.trading_date}.json"
+
+    def _save_state(self):
+        """Saves current strategy state to JSON."""
+        def serialize_setup(setup):
+            if not setup: return None
+            s = setup.copy()
+            s['contract'] = asdict(s['contract'])
+            s['ts'] = s['ts'].isoformat()
+            return s
+
+        def serialize_pos(pos):
+            if not pos: return {}
+            p = pos.copy()
+            if 'contract' in p:
+                p['contract'] = asdict(p['contract'])
+            return p
+
+        state = {
+            "active_pe_setup": serialize_setup(self.active_pe_setup),
+            "active_ce_setup": serialize_setup(self.active_ce_setup),
+            "in_position": self.in_position,
+            "position_info": serialize_pos(self.position_info),
+            "closed_pnl": self.closed_pnl,
+            "is_paused": self.is_paused,
+            "subscribed_tokens": list(self.subscribed_tokens)
+        }
+        
+        try:
+            with open(self._get_state_file(), 'w') as f:
+                json.dump(state, f, indent=4)
+        except Exception as e:
+            log.error(f"Failed to save state: {e}")
+
+    def _load_state(self):
+        """Loads strategy state from JSON."""
+        state_file = self._get_state_file()
+        if not state_file.exists(): return
+
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            def deserialize_contract(d):
+                return OptionContract(**d)
+
+            def deserialize_setup(d):
+                if not d: return None
+                d['contract'] = deserialize_contract(d['contract'])
+                d['ts'] = datetime.fromisoformat(d['ts'])
+                return d
+
+            def deserialize_pos(d):
+                if not d: return {}
+                if 'contract' in d:
+                    d['contract'] = deserialize_contract(d['contract'])
+                return d
+
+            self.active_pe_setup = deserialize_setup(state.get("active_pe_setup"))
+            self.active_ce_setup = deserialize_setup(state.get("active_ce_setup"))
+            self.in_position = state.get("in_position", False)
+            self.position_info = deserialize_pos(state.get("position_info"))
+            self.closed_pnl = state.get("closed_pnl", 0.0)
+            self.is_paused = state.get("is_paused", False)
+            
+            saved_tokens = state.get("subscribed_tokens", [])
+            self.subscribed_tokens.update(saved_tokens)
+
+            log.info(f"{Fore.GREEN}State Resumed from {state_file}{Style.RESET_ALL}")
+            if self.in_position:
+                c = self.position_info['contract']
+                log.info(f"Resumed Active Position: {c.symbol} | Entry: {self.position_info['entry_price']}")
+            if self.active_pe_setup:
+                log.info(f"Resumed PE Setup: {self.active_pe_setup['contract'].symbol}")
+            if self.active_ce_setup:
+                log.info(f"Resumed CE Setup: {self.active_ce_setup['contract'].symbol}")
+            log.info(f"Resumed Stats: Closed PnL={self.closed_pnl}, Paused={self.is_paused}")
+
+        except Exception as e:
+            log.error(f"Failed to load state: {e}")
 
     def _is_trading_allowed(self, t: dt_time) -> bool:
         """Checks if the current time falls into an allowed trading hour slot."""
@@ -192,22 +308,30 @@ class ITMMomentumStrategy:
     def _handle_telegram_command(self, command: str):
         """Callback for Telegram commands."""
         cmd = command.lower()
-        if cmd == "/stop":
+        if cmd in ["/stop", "stop"]:
             self.is_paused = True
             msg = "🛑 <b>Strategy PAUSED</b>\nNo new setups will be scanned or triggered.\nExisting positions will be managed."
             log.warning("Telegram command received: STOP")
             if self.telegram: self.telegram.send_message(msg)
+            self._save_state()
+            
+            # Close WS if not in position to save resources
+            if not self.in_position and self.ws and hasattr(self.ws, 'wsapp') and self.ws.wsapp:
+                log.info("Pausing strategy: Closing WebSocket...")
+                self.ws.wsapp.close()
         
-        elif cmd == "/start":
+        elif cmd in ["/start", "start"]:
             self.is_paused = False
             msg = "✅ <b>Strategy RESUMED</b>\nScanning for new setups..."
             log.info("Telegram command received: START")
             if self.telegram: self.telegram.send_message(msg)
+            self._save_state()
             
-        elif cmd == "/status":
+        elif cmd in ["/status", "status"]:
             status = "🔴 PAUSED" if self.is_paused else "🟢 RUNNING"
             pos_status = f"In Position ({self.position_info.get('contract', {}).get('symbol', '')})" if self.in_position else "Scanning"
-            msg = f"ℹ️ <b>STATUS REPORT</b>\nState: {status}\nActivity: {pos_status}\nClosed PnL: {self.closed_pnl:.2f}"
+            mode = "SIM" if self.simulate_orders else "LIVE"
+            msg = f"ℹ️ <b>STATUS REPORT [{mode}]</b>\nState: {status}\nActivity: {pos_status}\nClosed PnL: {self.closed_pnl:.2f}"
             if self.telegram: self.telegram.send_message(msg)
 
     def _get_itm_strike(self, spot: float, option_type: str) -> int:
@@ -357,12 +481,14 @@ class ITMMomentumStrategy:
         )
         
         if self.telegram:
-            msg = f"⚠️ <b>SETUP ARMED ({setup_type})</b>\n" \
+            prefix = "[SIM] " if self.simulate_orders else ""
+            msg = f"⚠️ <b>{prefix}SETUP ARMED: {self.index_name} {setup_type}</b>\n" \
                   f"Symbol: {contract.symbol}\n" \
                   f"Spot Trigger: {spot_trigger}\n" \
                   f"Opt Trigger: {opt_high}\n" \
                   f"Time: {setup_time_str}"
             self.telegram.send_message(msg)
+        self._save_state()
 
     def _subscribe_to_token(self, token: str):
         if token not in self.subscribed_tokens:
@@ -381,12 +507,43 @@ class ITMMomentumStrategy:
                 
                 self.ws.subscribe("itm_strategy", 3, req_list)
 
+    def _log_trade(self, contract, entry_price, exit_price, pnl, reason, max_points=0.0):
+        """Logs the completed trade to a CSV file for the dashboard."""
+        filename = "itm_trades_sim.csv" if self.simulate_orders else "itm_trades.csv"
+        file_path = Path(f"data/live/{filename}")
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = file_path.exists()
+        
+        try:
+            with open(file_path, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["Date", "Index", "Symbol", "Type", "Setup Time", "Entry Time", "Entry Price", "Exit Time", "Exit Price", "PnL", "Reason", "Max Points"])
+                
+                writer.writerow([
+                    self.trading_date,
+                    self.index_name,
+                    contract.symbol,
+                    contract.option_type,
+                    self.position_info.get("setup_time", ""),
+                    self.position_info.get("entry_time", ""),
+                    entry_price,
+                    datetime.now().strftime("%H:%M:%S"),
+                    exit_price,
+                    f"{pnl:.2f}",
+                    reason,
+                    f"{max_points:.2f}"
+                ])
+        except Exception as e:
+            log.error(f"Failed to log trade to CSV: {e}")
+
     def _execute_entry(self, ltp: float, setup: dict):
         contract = setup['contract']
         qty = self.quantity
         
         log.info(f"{Fore.GREEN}*** ENTRY TRIGGERED *** {contract.symbol} @ {ltp} | Spot crossed {setup['spot_trigger']}{Style.RESET_ALL}")
-        
+
+        setup_time_str = setup['ts'].strftime("%H:%M:%S")
         if not self.simulate_orders:
             try:
                 order_id = self.api.place_order(contract.symbol, contract.token, qty, "BUY", product_type="INTRADAY")
@@ -404,6 +561,8 @@ class ITMMomentumStrategy:
             "target": ltp + self.target_points,
             "qty": qty,
             "highest_ltp": ltp,
+            "entry_time": datetime.now().strftime("%H:%M:%S"),
+            "setup_time": setup_time_str,
         }
         # Clear ALL setups on entry
         self.active_pe_setup = None
@@ -411,12 +570,14 @@ class ITMMomentumStrategy:
         log.info(f"Position Active: Target {self.position_info['target']:.2f} | SL {self.position_info['sl']:.2f}")
         
         if self.telegram:
-            msg = f"🚀 <b>ENTRY TRIGGERED</b>\n" \
+            prefix = "[SIM] " if self.simulate_orders else ""
+            msg = f"🚀 <b>{prefix}ENTRY TRIGGERED: {self.index_name}</b>\n" \
                   f"Symbol: {contract.symbol}\n" \
                   f"Price: {ltp}\n" \
                   f"Target: {self.position_info['target']:.2f}\n" \
                   f"SL: {self.position_info['sl']:.2f}"
             self.telegram.send_message(msg)
+        self._save_state()
 
     def _execute_exit(self, ltp: float, reason: str):
         pos = self.position_info
@@ -426,6 +587,10 @@ class ITMMomentumStrategy:
         exit_time_str = datetime.now().strftime("%H:%M:%S")
         log.info(f"{Fore.MAGENTA}*** EXIT TRIGGERED ({reason}) at {exit_time_str} *** {contract.symbol} @ {ltp} | PNL: {pnl:.2f}{Style.RESET_ALL}")
         
+        # Log trade to CSV for Dashboard
+        max_points = pos.get('highest_ltp', pos['entry_price']) - pos['entry_price']
+        self._log_trade(contract, pos['entry_price'], ltp, pnl, reason, max_points)
+        
         if not self.simulate_orders:
             try:
                 self.api.place_order(contract.symbol, contract.token, pos['qty'], "SELL", product_type="INTRADAY")
@@ -434,6 +599,14 @@ class ITMMomentumStrategy:
 
         self.closed_pnl += pnl
         self.in_position = False
+        
+        # Check for max daily loss
+        if self.closed_pnl <= -self.max_daily_loss:
+            log.warning(f"{Fore.RED}Max daily loss limit reached ({self.closed_pnl:.2f} <= -{self.max_daily_loss}). Stopping trading for the day.{Style.RESET_ALL}")
+            if self.telegram:
+                prefix = "[SIM] " if self.simulate_orders else ""
+                self.telegram.send_message(f"🛑 <b>{prefix}Max Daily Loss Reached</b>\nTrading stopped for the day.\nPnL: {self.closed_pnl:.2f}")
+
         self.last_exit_time = datetime.now()
         self.position_info = {}
         # Reset subscribed tokens to just Spot to save bandwidth/confusion
@@ -442,16 +615,19 @@ class ITMMomentumStrategy:
 
         if self.telegram:
             emoji = "✅" if pnl >= 0 else "❌"
-            msg = f"{emoji} <b>EXIT TRIGGERED ({reason})</b>\n" \
+            prefix = "[SIM] " if self.simulate_orders else ""
+            msg = f"{emoji} <b>{prefix}EXIT: {self.index_name} ({reason})</b>\n" \
                   f"Symbol: {contract.symbol}\n" \
                   f"Exit Price: {ltp}\n" \
                   f"PnL: {pnl:.2f}"
             self.telegram.send_message(msg)
+        self._save_state()
 
     def _process_tick(self, token: str, ltp: float):
         # Check for dynamic config updates
         if self._load_config() and self.in_position:
             entry = self.position_info['entry_price']
+
             self.position_info['target'] = entry + self.target_points
             
             # Recalculate SL based on new config and current high
@@ -460,8 +636,15 @@ class ITMMomentumStrategy:
             
             new_sl = entry - self.sl_points # Base SL
             
-            if peak_pts >= self.trailing_activation_points:
-                trail_sl = highest - self.trailing_distance_points
+            # Find applicable tier
+            active_distance = None
+            for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
+                if peak_pts >= tier['activation']:
+                    active_distance = tier['distance']
+                    break
+            
+            if active_distance is not None:
+                trail_sl = highest - active_distance
                 new_sl = max(new_sl, trail_sl)
             
             self.position_info['sl'] = new_sl
@@ -484,6 +667,10 @@ class ITMMomentumStrategy:
         # If outside allowed hours and not in position AND no active setups, stop processing (no new scans)
         has_active_setups = (self.active_pe_setup is not None) or (self.active_ce_setup is not None)
         if not self._is_trading_allowed(now.time()) and not self.in_position and not has_active_setups:
+            return
+
+        # Check for max daily loss
+        if self.closed_pnl <= -self.max_daily_loss and not self.in_position:
             return
 
         # 2. Minute-based Candle Check (Only runs once per minute)
@@ -537,8 +724,15 @@ class ITMMomentumStrategy:
                 
                 # Trailing SL Logic
                 peak_pts = pos['highest_ltp'] - pos['entry_price']
-                if peak_pts >= self.trailing_activation_points:
-                    new_sl = pos['highest_ltp'] - self.trailing_distance_points
+
+                active_distance = None
+                for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
+                    if peak_pts >= tier['activation']:
+                        active_distance = tier['distance']
+                        break
+                
+                if active_distance is not None:
+                    new_sl = pos['highest_ltp'] - active_distance
                     if new_sl > pos['sl']:
                         pos['sl'] = new_sl
                         log.info(f"{Fore.MAGENTA}Trailing SL Updated: {new_sl:.2f} (Peak Pts: {peak_pts:.2f}){Style.RESET_ALL}")
@@ -581,6 +775,9 @@ class ITMMomentumStrategy:
     def run(self):
         log.info("Starting Strategy Loop...")
         
+        if self.telegram:
+            self.telegram.start_listening(self._handle_telegram_command)
+
         # Wait for start time
         now = datetime.now()
         start_time = dt_time(9, 15)
@@ -589,11 +786,34 @@ class ITMMomentumStrategy:
             log.info(f"Waiting {wait_s:.0f}s for market open (9:15)...")
             time_module.sleep(wait_s)
 
-        if self.telegram:
-            self.telegram.start_listening(self._handle_telegram_command)
-
         # --- Main Reconnection Loop ---
         while True:
+            # Check for Day Change
+            if date.today() > self.trading_date:
+                log.info(f"Date changed: {self.trading_date} -> {date.today()}. Resetting daily stats.")
+                self.trading_date = date.today()
+                self.expiry = get_next_expiry(self.index_name, self.trading_date)
+                self.closed_pnl = 0.0
+                self.is_paused = False
+                self.active_pe_setup = None
+                self.active_ce_setup = None
+                self.last_exit_time = None
+                self.position_info = {}
+                self._load_config()
+                
+                # Wait for 9:15 again
+                now = datetime.now()
+                start_time = dt_time(9, 15)
+                if now.time() < start_time:
+                    wait_s = (datetime.combine(now.date(), start_time) - now).total_seconds()
+                    log.info(f"Waiting {wait_s:.0f}s for market open (9:15)...")
+                    time_module.sleep(wait_s)
+
+            # If paused and not in position, stay in standby mode (no WS connection)
+            if self.is_paused and not self.in_position:
+                time_module.sleep(1)
+                continue
+
             try:
                 if SmartWebSocketV2 is None:
                     log.error("SmartWebSocketV2 library not available. Exiting.")

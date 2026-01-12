@@ -3,8 +3,11 @@ NIFTY:
   num_lots: 1
   sl_points: 15
   target_points: 25
-  trailing_activation_points: 12
-  trailing_distance_points: 15
+  trailing_sl_tiers:
+    - activation: 12
+      distance: 15
+    - activation: 20
+      distance: 5
   ce_setup_allowed: true
   pe_setup_allowed: true
   current_ce_setup_discard: false
@@ -22,8 +25,9 @@ SENSEX:
   num_lots: 1
   sl_points: 10
   target_points: 15
-  trailing_activation_points: 10
-  trailing_distance_points: 10
+  trailing_sl_tiers:
+    - activation: 10
+      distance: 10
   ce_setup_allowed: true
   pe_setup_allowed: true
   current_ce_setup_discard: false

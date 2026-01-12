@@ -18,9 +18,14 @@ class TelegramBot:
 
     def send_message(self, message: str):
         if not self.enabled or not self.bot_token or not self.chat_id:
+            if not self.enabled:
+                log.info("Telegram: Message skipped (Disabled)")
+            elif not self.bot_token or not self.chat_id:
+                log.warning("Telegram: Message skipped (Missing Credentials)")
             return
 
         try:
+            log.info(f"Telegram: Sending message to {self.chat_id}...")
             payload = {
                 "chat_id": self.chat_id,
                 "text": message,
@@ -30,6 +35,8 @@ class TelegramBot:
             response = requests.post(self.base_url, json=payload, timeout=3)
             if response.status_code != 200:
                 log.error(f"Telegram send failed: {response.text}")
+            else:
+                log.info("Telegram: Message sent successfully.")
         except Exception as e:
             log.error(f"Telegram error: {e}")
 
@@ -57,8 +64,7 @@ class TelegramBot:
                             text = message.get("text", "").strip()
                             
                             if sender_id == self.chat_id:
-                                if text.startswith("/"):
-                                    callback(text)
+                                callback(text)
                             else:
                                 log.warning(f"Ignored command from unauthorized chat_id: {sender_id}")
             except Exception as e:

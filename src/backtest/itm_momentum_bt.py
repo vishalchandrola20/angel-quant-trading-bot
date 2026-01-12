@@ -54,10 +54,10 @@ class ITMMomentumBacktest:
         self.config_file = Path("config/itm_momentum.yaml")
         self.sl_points = 10
         self.target_points = 15
-        self.trailing_activation_points = 10
-        self.trailing_distance_points = 10
+        self.trailing_sl_tiers = []
         self.lot_size = 65 if self.index_name == "NIFTY" else 20
         self.num_lots = 1
+        self.max_daily_loss = 1500
         self.ce_setup_allowed = True
         self.pe_setup_allowed = True
         self.current_ce_setup_discard = False
@@ -76,8 +76,14 @@ class ITMMomentumBacktest:
                 idx_config = config.get(self.index_name, {})
                 self.sl_points = idx_config.get("sl_points", 10)
                 self.target_points = idx_config.get("target_points", 15)
-                self.trailing_activation_points = idx_config.get("trailing_activation_points", 10)
-                self.trailing_distance_points = idx_config.get("trailing_distance_points", 10)
+                
+                self.max_daily_loss = idx_config.get("max_daily_loss", 1500)
+                self.trailing_sl_tiers = idx_config.get("trailing_sl_tiers", [])
+                if not self.trailing_sl_tiers:
+                    act = idx_config.get("trailing_activation_points", 10)
+                    dist = idx_config.get("trailing_distance_points", 10)
+                    self.trailing_sl_tiers = [{"activation": act, "distance": dist}]
+
                 self.lot_size = idx_config.get("lot_size", self.lot_size)
                 self.num_lots = idx_config.get("num_lots", self.num_lots)
                 self.ce_setup_allowed = idx_config.get("ce_setup_allowed", True)
@@ -202,6 +208,13 @@ class ITMMomentumBacktest:
         scan_times = [t for t in spot_df.index if start_time <= t <= end_scan_time]
         
         for current_ts in scan_times:
+            current_day_pnl_points = sum(r['pnl'] for r in self.results)
+            quantity = self.lot_size * self.num_lots
+            current_day_pnl = current_day_pnl_points * quantity
+            if current_day_pnl <= -self.max_daily_loss:
+                log.info(f"Skipping {current_ts.time()} (Max daily loss limit reached: {current_day_pnl:.2f} <= -{self.max_daily_loss})")
+                break
+
             # Skip scanning if we are currently in a trade
             if last_exit_time and current_ts <= last_exit_time:
                 log.info(f"Skipping {current_ts.time()} (Trade active/just finished until {last_exit_time.time()})")
@@ -332,7 +345,7 @@ class ITMMomentumBacktest:
                             entry_price = max(opt_candle.open, setup['opt_trigger'])
                             log.info(f"{Fore.GREEN}  >>> ENTRY {setup['type']} {contract.symbol} @ {entry_price} (Time: {current_ts.time()}){Style.RESET_ALL}")
                             
-                            exit_time = self._simulate_trade(contract, entry_price, current_ts, trading_date)
+                            exit_time = self._simulate_trade(contract, entry_price, current_ts, trading_date, setup['setup_time'])
                             last_exit_time = exit_time
                             
                             # Reset ALL setups on entry
@@ -345,7 +358,7 @@ class ITMMomentumBacktest:
                 else:
                     log.info(f"  Spot Trigger Fail: {spot_candle.low if setup['type']=='PE' else spot_candle.high} vs {setup['spot_trigger']}")
 
-    def _simulate_trade(self, contract, entry_price, entry_time, trading_date):
+    def _simulate_trade(self, contract, entry_price, entry_time, trading_date, setup_time):
         sl = entry_price - self.sl_points
         target = entry_price + self.target_points
         
@@ -409,8 +422,15 @@ class ITMMomentumBacktest:
                 highest_price_during_trade = row.high
                 
                 peak_pts = highest_price_during_trade - entry_price
-                if peak_pts >= self.trailing_activation_points:
-                    trail_sl = highest_price_during_trade - self.trailing_distance_points
+                
+                active_distance = None
+                for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
+                    if peak_pts >= tier['activation']:
+                        active_distance = tier['distance']
+                        break
+                
+                if active_distance is not None:
+                    trail_sl = highest_price_during_trade - active_distance
                     if trail_sl > sl:
                         sl = trail_sl
         
@@ -432,6 +452,7 @@ class ITMMomentumBacktest:
             "date": trading_date,
             "type": contract.option_type,
             "symbol": contract.symbol,
+            "setup_time": setup_time.time(),
             "entry_time": entry_time.time(),
             "exit_time": exit_time.time(),
             "entry_price": entry_price,

@@ -4,6 +4,15 @@ Here is a cheat sheet for running the various strategies and tools in this proje
 
 ---
 
+## 🛠️ Setup & Installation
+
+Install all required libraries (including new ones like Streamlit & Plotly).
+```bash
+pip install -r requirements.txt
+```
+
+---
+
 ## 🚀 ITM Momentum Breakdown Strategy
 
 ### 1. Backtesting
@@ -64,6 +73,14 @@ python -m src.live.itm_momentum_breakdown --index SENSEX --live
 ---
 
 ## 🦅 Iron Condor Strategy
+
+### 1. Backtesting
+*Note: This assumes a backtest script `src/backtest/iron_condor_bt.py` exists.*
+```bash
+python -m src.main --task backtest_iron_condor --date 2025-12-30
+```
+
+### 2. Live Trading & Simulation
 
 **Simulation Mode**
 ```bash
