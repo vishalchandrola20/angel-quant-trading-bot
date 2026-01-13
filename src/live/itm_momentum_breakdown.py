@@ -87,6 +87,7 @@ class ITMMomentumStrategy:
         self.current_ce_setup_discard = False
         self.current_pe_setup_discard = False
         self.allowed_trading_hours = {h: True for h in range(9, 15)}
+        self.slippage_buffer = 0.5
         self.telegram: TelegramBot | None = None
         self.ws = None
         self._load_config()
@@ -103,6 +104,10 @@ class ITMMomentumStrategy:
         self.last_exit_time: datetime | None = None
         self.is_paused = False # Controls whether we scan for new trades
         self.max_daily_loss = 1500
+        self.profit_lock_threshold = 3000
+        self.profit_drawdown_limit = 1500
+        self.profit_locking_active = False
+        self.peak_closed_pnl = 0.0
         
         # State Persistence
         self.state_dir = Path("data/state")
@@ -142,6 +147,9 @@ class ITMMomentumStrategy:
                     self.sl_points = idx_config.get("sl_points", self.sl_points)
                     self.target_points = idx_config.get("target_points", self.target_points)
                     self.max_daily_loss = idx_config.get("max_daily_loss", 1500)
+                    self.slippage_buffer = idx_config.get("slippage_buffer", 0.5)
+                    self.profit_lock_threshold = idx_config.get("profit_lock_threshold", 3000)
+                    self.profit_drawdown_limit = idx_config.get("profit_drawdown_limit", 1500)
                     
                     self.trailing_sl_tiers = idx_config.get("trailing_sl_tiers", [])
                     if not self.trailing_sl_tiers:
@@ -204,7 +212,8 @@ class ITMMomentumStrategy:
                         self.telegram.send_message(
                             f"⚙️ <b>Config Loaded ({self.trading_date})</b>\n"
                             f"SL: {self.sl_points} | Target: {self.target_points}\n"
-                            f"Qty: {self.quantity} | Max Loss: {self.max_daily_loss}"
+                            f"Qty: {self.quantity} | Max Loss: {self.max_daily_loss}\n"
+                            f"Profit Lock: {self.profit_lock_threshold} | Drawdown: {self.profit_drawdown_limit}"
                         )
                     updated = True
             except Exception as e:
@@ -237,6 +246,9 @@ class ITMMomentumStrategy:
             "position_info": serialize_pos(self.position_info),
             "closed_pnl": self.closed_pnl,
             "is_paused": self.is_paused,
+            "profit_locking_active": self.profit_locking_active,
+            "peak_closed_pnl": self.peak_closed_pnl,
+            # Note: We don't persist order_ids for pending setups across restarts for safety (risk of orphan orders)
             "subscribed_tokens": list(self.subscribed_tokens)
         }
         
@@ -276,6 +288,8 @@ class ITMMomentumStrategy:
             self.position_info = deserialize_pos(state.get("position_info"))
             self.closed_pnl = state.get("closed_pnl", 0.0)
             self.is_paused = state.get("is_paused", False)
+            self.profit_locking_active = state.get("profit_locking_active", False)
+            self.peak_closed_pnl = state.get("peak_closed_pnl", 0.0)
             
             saved_tokens = state.get("subscribed_tokens", [])
             self.subscribed_tokens.update(saved_tokens)
@@ -288,7 +302,7 @@ class ITMMomentumStrategy:
                 log.info(f"Resumed PE Setup: {self.active_pe_setup['contract'].symbol}")
             if self.active_ce_setup:
                 log.info(f"Resumed CE Setup: {self.active_ce_setup['contract'].symbol}")
-            log.info(f"Resumed Stats: Closed PnL={self.closed_pnl}, Paused={self.is_paused}")
+            log.info(f"Resumed Stats: Closed PnL={self.closed_pnl}, Paused={self.is_paused}, ProfitLock={self.profit_locking_active}, PeakPnL={self.peak_closed_pnl}")
 
         except Exception as e:
             log.error(f"Failed to load state: {e}")
@@ -301,6 +315,10 @@ class ITMMomentumStrategy:
         
         # Valid slots are 9 to 14 (covering 09:15 to 15:15)
         if slot < 9 or slot > 14:
+            return False
+            
+        # Special case for Slot 14: Stop strictly at 15:00
+        if slot == 14 and t.hour == 15:
             return False
             
         return self.allowed_trading_hours.get(slot, False)
@@ -333,6 +351,32 @@ class ITMMomentumStrategy:
             mode = "SIM" if self.simulate_orders else "LIVE"
             msg = f"ℹ️ <b>STATUS REPORT [{mode}]</b>\nState: {status}\nActivity: {pos_status}\nClosed PnL: {self.closed_pnl:.2f}"
             if self.telegram: self.telegram.send_message(msg)
+
+    def _cancel_setup_order(self, setup: dict):
+        """Cancels the pending SL-L order associated with a setup."""
+        if not setup or 'order_id' not in setup or not setup['order_id']:
+            return
+            
+        order_id = setup['order_id']
+        log.info(f"Cancelling pending setup order: {order_id}")
+        
+        try:
+            # SL-L orders are placed with STOPLOSS variety
+            self.api.connection.cancelOrder(order_id, variety="STOPLOSS")
+        except Exception as e:
+            log.error(f"Failed to cancel setup order {order_id}: {e}")
+
+    def _clear_setup(self, setup_type: str):
+        """Clears the setup and cancels any pending orders."""
+        if setup_type == "PE":
+            if self.active_pe_setup:
+                if not self.simulate_orders: self._cancel_setup_order(self.active_pe_setup)
+                self.active_pe_setup = None
+        elif setup_type == "CE":
+            if self.active_ce_setup:
+                if not self.simulate_orders: self._cancel_setup_order(self.active_ce_setup)
+                self.active_ce_setup = None
+        self._save_state()
 
     def _get_itm_strike(self, spot: float, option_type: str) -> int:
         """
@@ -423,25 +467,25 @@ class ITMMomentumStrategy:
 
         # Check 3 Green Candles (Put Setup)
         if self.pe_setup_allowed and c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open']:
-            is_continuation = False
-            if self.active_pe_setup:
-                if c0 and c0['close'] > c0['open']:
-                    is_continuation = True
-            
-            if not is_continuation:
+            # Only initiate if no PE setup is currently active
+            if not self.active_pe_setup:
                 log.info(f"{Fore.YELLOW}Pattern Detected: 3 Green Candles (Spot {c3['close']}). Checking Put Setup...{Style.RESET_ALL}")
                 self._initiate_setup("PE", c1, c3['close'])
+        # If the pattern of 3 green candles is broken, clear any active PE setup
+        elif self.active_pe_setup:
+            log.info("PE Setup invalidated (Pattern broken).")
+            self._clear_setup("PE")
 
         # Check 3 Red Candles (Call Setup)
         elif self.ce_setup_allowed and c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open']:
-            is_continuation = False
-            if self.active_ce_setup:
-                if c0 and c0['close'] < c0['open']:
-                    is_continuation = True
-            
-            if not is_continuation:
+            # Only initiate if no CE setup is currently active
+            if not self.active_ce_setup:
                 log.info(f"{Fore.YELLOW}Pattern Detected: 3 Red Candles (Spot {c3['close']}). Checking Call Setup...{Style.RESET_ALL}")
                 self._initiate_setup("CE", c1, c3['close'])
+        # If the pattern of 3 red candles is broken, clear any active CE setup
+        elif self.active_ce_setup:
+            log.info("CE Setup invalidated (Pattern broken).")
+            self._clear_setup("CE")
 
     def _initiate_setup(self, setup_type: str, ref_candle: dict, current_spot: float):
         """Prepares the setup triggers."""
@@ -464,11 +508,42 @@ class ITMMomentumStrategy:
             "contract": contract,
             "spot_trigger": spot_trigger,
             "opt_trigger": opt_high,
-            "ts": datetime.now()
+            "ts": datetime.now(),
+            "order_id": None # Will be populated for live orders
         }
         
-        if setup_type == "PE": self.active_pe_setup = setup_data
-        else: self.active_ce_setup = setup_data
+        # --- HARDCORE ALGO: Pre-place Stop Loss Limit Order ---
+        if not self.simulate_orders:
+            try:
+                limit_price = round(opt_high + self.slippage_buffer, 1)
+                trigger_price = round(opt_high, 1)
+                
+                log.info(f"Placing Pending SL-L Order: Trigger {trigger_price}, Limit {limit_price}")
+                
+                orderparams = {
+                    "variety": "STOPLOSS",
+                    "tradingsymbol": contract.symbol,
+                    "symboltoken": contract.token,
+                    "transactiontype": "BUY",
+                    "exchange": contract.exchange,
+                    "ordertype": "STOPLOSS_LIMIT",
+                    "producttype": "INTRADAY",
+                    "duration": "DAY",
+                    "price": limit_price,
+                    "triggerprice": trigger_price,
+                    "quantity": self.quantity
+                }
+                order_id = self.api.connection.placeOrder(orderparams)
+                setup_data['order_id'] = order_id
+                log.info(f"Pending Order Placed: {order_id}")
+            except Exception as e:
+                log.error(f"Failed to place pending order: {e}")
+                return # Don't arm setup if order failed
+        
+        if setup_type == "PE":
+            self.active_pe_setup = setup_data
+        else:
+            self.active_ce_setup = setup_data
         
         # Subscribe to the option token for live monitoring
         self._subscribe_to_token(contract.token)
@@ -483,6 +558,7 @@ class ITMMomentumStrategy:
         if self.telegram:
             prefix = "[SIM] " if self.simulate_orders else ""
             msg = f"⚠️ <b>{prefix}SETUP ARMED: {self.index_name} {setup_type}</b>\n" \
+                  f"Order ID: {setup_data.get('order_id', 'N/A')}\n" \
                   f"Symbol: {contract.symbol}\n" \
                   f"Spot Trigger: {spot_trigger}\n" \
                   f"Opt Trigger: {opt_high}\n" \
@@ -537,43 +613,91 @@ class ITMMomentumStrategy:
         except Exception as e:
             log.error(f"Failed to log trade to CSV: {e}")
 
-    def _execute_entry(self, ltp: float, setup: dict):
-        contract = setup['contract']
-        qty = self.quantity
+    def _wait_for_fill(self, order_id: str, timeout: int = 60) -> float | None:
+        """Polls the order book to confirm fill and get actual price."""
+        log.info(f"Polling for fill: Order ID {order_id}")
+        start_time = time_module.time()
         
-        log.info(f"{Fore.GREEN}*** ENTRY TRIGGERED *** {contract.symbol} @ {ltp} | Spot crossed {setup['spot_trigger']}{Style.RESET_ALL}")
-
-        setup_time_str = setup['ts'].strftime("%H:%M:%S")
-        if not self.simulate_orders:
+        while time_module.time() - start_time < timeout:
             try:
-                order_id = self.api.place_order(contract.symbol, contract.token, qty, "BUY", product_type="INTRADAY")
-                log.info(f"Order placed: {order_id}")
-                # In a real bot, we would poll for fill price. Here we assume fill at LTP for simplicity or add polling logic.
+                # Fetch order status
+                status = self.api.get_order_status(order_id)
+                
+                if status:
+                    order_status = status.get('status') # 'complete', 'rejected', 'open', 'cancelled'
+                    if order_status == 'complete':
+                        avg_price = float(status.get('averageprice', 0.0))
+                        log.info(f"✅ Order filled at {avg_price}")
+                        return avg_price
+                    elif order_status in ['rejected', 'cancelled']:
+                        log.error(f"❌ Order {order_status}: {status.get('text')}")
+                        return None
             except Exception as e:
-                log.error(f"Order placement failed: {e}")
-                return
+                log.error(f"Polling Error: {e}")
+            
+            time_module.sleep(1)
+            
+        log.warning(f"⚠️ Order {order_id} not filled within {timeout}s timeout.")
+        return None
 
+    def _wait_for_fill_sim(self, contract, limit_price, timeout=60) -> float | None:
+        """Simulates polling for a fill by checking LTP via REST API."""
+        log.info(f"SIMULATION: Polling for fill for {contract.symbol} @ {limit_price}...")
+        start_time = time_module.time()
+        
+        while time_module.time() - start_time < timeout:
+            try:
+                # Fetch current LTP via REST to avoid blocking WS issues
+                curr_ltp = self.api.get_ltp(contract.exchange, contract.symbol, contract.token)
+                if curr_ltp is not None and curr_ltp <= limit_price:
+                    log.info(f"✅ SIMULATION: Order filled at {curr_ltp} (<= {limit_price})")
+                    return limit_price
+            except Exception as e:
+                log.error(f"Simulation Polling Error: {e}")
+            
+            time_module.sleep(1)
+            
+        log.warning(f"⚠️ SIMULATION: Order not filled within {timeout}s timeout.")
+        return None
+
+    def _execute_entry(self, filled_price: float, setup: dict):
+        """Transitions state to 'in_position' after an order is confirmed filled."""
+        contract = setup['contract']
+        setup_time_str = setup['ts'].strftime("%H:%M:%S")
+        
+        if self.simulate_orders:
+            log.info(f"{Fore.GREEN}*** SIM ENTRY TRIGGERED *** {contract.symbol} @ {filled_price}{Style.RESET_ALL}")
+        else:
+            log.info(f"{Fore.GREEN}*** LIVE ENTRY CONFIRMED *** {contract.symbol} @ {filled_price} | Order: {setup.get('order_id')}{Style.RESET_ALL}")
+        
         self.in_position = True
         self.position_info = {
             "contract": contract,
-            "entry_price": ltp,
-            "sl": ltp - self.sl_points,
-            "target": ltp + self.target_points,
-            "qty": qty,
-            "highest_ltp": ltp,
+            "entry_price": filled_price,
+            "sl": filled_price - self.sl_points,
+            "target": filled_price + self.target_points,
+            "qty": self.quantity,
+            "highest_ltp": filled_price,
             "entry_time": datetime.now().strftime("%H:%M:%S"),
             "setup_time": setup_time_str,
         }
-        # Clear ALL setups on entry
-        self.active_pe_setup = None
-        self.active_ce_setup = None
+        
+        # Clear setups: Just clear the triggered one (order filled), cancel the other (pending)
+        if setup['type'] == 'PE':
+            self.active_pe_setup = None
+            self._clear_setup("CE")
+        else:
+            self.active_ce_setup = None
+            self._clear_setup("PE")
+
         log.info(f"Position Active: Target {self.position_info['target']:.2f} | SL {self.position_info['sl']:.2f}")
         
         if self.telegram:
             prefix = "[SIM] " if self.simulate_orders else ""
+            price_type = "Limit" if self.simulate_orders else "Filled"
             msg = f"🚀 <b>{prefix}ENTRY TRIGGERED: {self.index_name}</b>\n" \
                   f"Symbol: {contract.symbol}\n" \
-                  f"Price: {ltp}\n" \
+                  f"Price: {filled_price} ({price_type})\n" \
                   f"Target: {self.position_info['target']:.2f}\n" \
                   f"SL: {self.position_info['sl']:.2f}"
             self.telegram.send_message(msg)
@@ -600,12 +724,43 @@ class ITMMomentumStrategy:
         self.closed_pnl += pnl
         self.in_position = False
         
+        # --- Profit Maximization & Protection Logic ---
+        if not self.profit_locking_active:
+            # Check if we crossed the threshold to activate locking
+            if self.closed_pnl >= self.profit_lock_threshold:
+                self.profit_locking_active = True
+                self.peak_closed_pnl = self.closed_pnl
+                log.info(f"{Fore.GREEN}Profit Locking Activated! PnL ({self.closed_pnl:.2f}) >= Threshold ({self.profit_lock_threshold}). Peak set to {self.peak_closed_pnl:.2f}{Style.RESET_ALL}")
+                if self.telegram:
+                    prefix = "[SIM] " if self.simulate_orders else ""
+                    self.telegram.send_message(f"💰 <b>{prefix}Profit Locking Activated</b>\nCurrent PnL: {self.closed_pnl:.2f}\nDrawdown Limit: {self.profit_drawdown_limit}")
+        else:
+            # Update peak if current PnL is higher
+            if self.closed_pnl > self.peak_closed_pnl:
+                self.peak_closed_pnl = self.closed_pnl
+                log.info(f"{Fore.GREEN}New Peak PnL: {self.peak_closed_pnl:.2f}{Style.RESET_ALL}")
+            
+            # Check for drawdown from peak
+            drawdown = self.peak_closed_pnl - self.closed_pnl
+            if drawdown >= self.profit_drawdown_limit:
+                log.warning(f"{Fore.RED}Profit drawdown limit reached. Peak: {self.peak_closed_pnl:.2f}, Current: {self.closed_pnl:.2f}, Drawdown: {drawdown:.2f} >= {self.profit_drawdown_limit}. Stopping trading.{Style.RESET_ALL}")
+                self.is_paused = True
+                if self.telegram:
+                    prefix = "[SIM] " if self.simulate_orders else ""
+                    self.telegram.send_message(f"🛑 <b>{prefix}Profit Protection Hit</b>\nTrading stopped.\nPeak PnL: {self.peak_closed_pnl:.2f}\nCurrent PnL: {self.closed_pnl:.2f}")
+
         # Check for max daily loss
         if self.closed_pnl <= -self.max_daily_loss:
             log.warning(f"{Fore.RED}Max daily loss limit reached ({self.closed_pnl:.2f} <= -{self.max_daily_loss}). Stopping trading for the day.{Style.RESET_ALL}")
+            self.is_paused = True
             if self.telegram:
                 prefix = "[SIM] " if self.simulate_orders else ""
                 self.telegram.send_message(f"🛑 <b>{prefix}Max Daily Loss Reached</b>\nTrading stopped for the day.\nPnL: {self.closed_pnl:.2f}")
+            
+            # Close WS to enforce standby mode in run loop
+            if self.ws and hasattr(self.ws, 'wsapp') and self.ws.wsapp:
+                log.info("Max loss reached: Closing WebSocket to pause strategy.")
+                self.ws.wsapp.close()
 
         self.last_exit_time = datetime.now()
         self.position_info = {}
@@ -685,42 +840,58 @@ class ITMMomentumStrategy:
             if self.is_paused:
                 return # Skip trigger checks if paused
 
+            # --- TRIGGER CHECK (Both Sim and Live) ---
+            # We monitor prices locally. If conditions are met, we assume the broker order (if live) 
+            # has triggered or is about to trigger, and we verify it.
+            
             spot_ltp = self.latest_ltp.get(self.index_token)
             
-            # Check both setups independently
-            setups_to_check = []
-            if self.active_pe_setup and self.pe_setup_allowed: setups_to_check.append(self.active_pe_setup)
-            if self.active_ce_setup and self.ce_setup_allowed: setups_to_check.append(self.active_ce_setup)
-
-            for setup in setups_to_check:
-                
+            # Filter out None setups first
+            active_setups = [s for s in [self.active_pe_setup, self.active_ce_setup] if s is not None]
+            
+            for setup in active_setups:
                 opt_ltp = self.latest_ltp.get(setup['contract'].token)
+                
                 if spot_ltp and opt_ltp:
-                    # Check Spot Condition
-                    spot_condition = False
-                    if setup['type'] == "PE":
-                        # Put Setup: Spot breaks BELOW trigger (Low of C1)
-                        if spot_ltp < setup['spot_trigger']: spot_condition = True
-                    else:
-                        # Call Setup: Spot breaks ABOVE trigger (High of C1)
-                        if spot_ltp > setup['spot_trigger']: spot_condition = True
+                    # Check Price Conditions
+                    spot_cond = (spot_ltp < setup['spot_trigger']) if setup['type'] == 'PE' else (spot_ltp > setup['spot_trigger'])
+                    opt_cond = opt_ltp > setup['opt_trigger']
                     
-                    # Check Option Condition
-                    opt_condition = opt_ltp > setup['opt_trigger']
-                    
-                    if spot_condition and opt_condition:
-                        self._execute_entry(opt_ltp, setup)
-                        break # Stop checking other setups if entered
+                    if spot_cond and opt_cond:
+                        log.info(f"{Fore.YELLOW}Local Trigger Detected: {setup['type']} Spot={spot_ltp} Opt={opt_ltp} > {setup['opt_trigger']}{Style.RESET_ALL}")
+                        
+                        if self.simulate_orders:
+                            # In sim, we must wait/verify fill at the trigger price
+                            fill_price = self._wait_for_fill_sim(setup['contract'], setup['opt_trigger'])
+                            if fill_price:
+                                self._execute_entry(fill_price, setup)
+                                return
+                        else:
+                            # In LIVE, since we pre-placed the order, it should be filling now.
+                            # We verify the status.
+                            order_id = setup.get('order_id')
+                            if order_id:
+                                # Poll briefly for confirmation
+                                fill_price = self._wait_for_fill(order_id, timeout=5)
+                                if fill_price:
+                                    self._execute_entry(fill_price, setup)
+                                    return
+                                else:
+                                    log.warning(f"Local trigger met but order {order_id} not filled yet. Waiting...")
+                                    # We don't cancel here; we let the order sit or next tick handle it.
+                                    # If market moves away, we just continue monitoring.
 
         # 4. Manage Position (TP/SL)
         if self.in_position:
             pos = self.position_info
             if token == pos['contract'].token:
+                state_changed = False
                 # Update Highest LTP
                 if ltp > pos.get('highest_ltp', pos['entry_price']):
                     pos['highest_ltp'] = ltp
                     peak_mtm = (ltp - pos['entry_price']) * pos['qty']
                     log.info(f"{Fore.CYAN}Peak MTM Updated: {peak_mtm:.2f} (LTP: {ltp}){Style.RESET_ALL}")
+                    state_changed = True
                 
                 # Trailing SL Logic
                 peak_pts = pos['highest_ltp'] - pos['entry_price']
@@ -736,6 +907,10 @@ class ITMMomentumStrategy:
                     if new_sl > pos['sl']:
                         pos['sl'] = new_sl
                         log.info(f"{Fore.MAGENTA}Trailing SL Updated: {new_sl:.2f} (Peak Pts: {peak_pts:.2f}){Style.RESET_ALL}")
+                        state_changed = True
+                
+                if state_changed:
+                    self._save_state()
 
                 current_pnl = (ltp - pos['entry_price']) * pos['qty']
                 pnl_color = Fore.GREEN if current_pnl >= 0 else Fore.RED
@@ -788,26 +963,13 @@ class ITMMomentumStrategy:
 
         # --- Main Reconnection Loop ---
         while True:
-            # Check for Day Change
-            if date.today() > self.trading_date:
-                log.info(f"Date changed: {self.trading_date} -> {date.today()}. Resetting daily stats.")
-                self.trading_date = date.today()
-                self.expiry = get_next_expiry(self.index_name, self.trading_date)
-                self.closed_pnl = 0.0
-                self.is_paused = False
-                self.active_pe_setup = None
-                self.active_ce_setup = None
-                self.last_exit_time = None
-                self.position_info = {}
-                self._load_config()
-                
-                # Wait for 9:15 again
-                now = datetime.now()
-                start_time = dt_time(9, 15)
-                if now.time() < start_time:
-                    wait_s = (datetime.combine(now.date(), start_time) - now).total_seconds()
-                    log.info(f"Waiting {wait_s:.0f}s for market open (9:15)...")
-                    time_module.sleep(wait_s)
+            # Check for End of Day
+            now = datetime.now()
+            market_close_time = dt_time(15, 31) # Give a minute buffer after 15:30
+            
+            if now.time() >= market_close_time:
+                log.info("Market closed (15:30). Exiting strategy script.")
+                break
 
             # If paused and not in position, stay in standby mode (no WS connection)
             if self.is_paused and not self.in_position:

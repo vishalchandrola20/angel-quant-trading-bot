@@ -58,6 +58,8 @@ class ITMMomentumBacktest:
         self.lot_size = 65 if self.index_name == "NIFTY" else 20
         self.num_lots = 1
         self.max_daily_loss = 1500
+        self.profit_lock_threshold = 3000
+        self.profit_drawdown_limit = 1500
         self.ce_setup_allowed = True
         self.pe_setup_allowed = True
         self.current_ce_setup_discard = False
@@ -78,6 +80,8 @@ class ITMMomentumBacktest:
                 self.target_points = idx_config.get("target_points", 15)
                 
                 self.max_daily_loss = idx_config.get("max_daily_loss", 1500)
+                self.profit_lock_threshold = idx_config.get("profit_lock_threshold", 3000)
+                self.profit_drawdown_limit = idx_config.get("profit_drawdown_limit", 1500)
                 self.trailing_sl_tiers = idx_config.get("trailing_sl_tiers", [])
                 if not self.trailing_sl_tiers:
                     act = idx_config.get("trailing_activation_points", 10)
@@ -198,6 +202,8 @@ class ITMMomentumBacktest:
         active_pe_setup = None
         active_ce_setup = None
         last_exit_time = None
+        profit_locking_active = False
+        peak_day_pnl = 0.0
         
         # Iterate minutes from 09:18 to 15:15 for setup detection
         # We need at least 3 previous candles (15, 16, 17) to check at 18
@@ -214,6 +220,19 @@ class ITMMomentumBacktest:
             if current_day_pnl <= -self.max_daily_loss:
                 log.info(f"Skipping {current_ts.time()} (Max daily loss limit reached: {current_day_pnl:.2f} <= -{self.max_daily_loss})")
                 break
+            
+            # Profit Protection Check
+            if profit_locking_active:
+                if current_day_pnl > peak_day_pnl:
+                    peak_day_pnl = current_day_pnl
+                
+                if peak_day_pnl - current_day_pnl >= self.profit_drawdown_limit:
+                    log.info(f"Skipping {current_ts.time()} (Profit protection hit: Peak {peak_day_pnl:.2f}, Current {current_day_pnl:.2f})")
+                    break
+            elif current_day_pnl >= self.profit_lock_threshold:
+                profit_locking_active = True
+                peak_day_pnl = current_day_pnl
+                log.info(f"Profit Locking Activated at {current_ts.time()}! PnL: {current_day_pnl:.2f}")
 
             # Skip scanning if we are currently in a trade
             if last_exit_time and current_ts <= last_exit_time:
