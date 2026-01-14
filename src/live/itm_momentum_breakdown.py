@@ -331,6 +331,12 @@ class ITMMomentumStrategy:
             msg = "🛑 <b>Strategy PAUSED</b>\nNo new setups will be scanned or triggered.\nExisting positions will be managed."
             log.warning("Telegram command received: STOP")
             if self.telegram: self.telegram.send_message(msg)
+
+            # Clear all active setups and cancel pending orders
+            log.info("Clearing all active setups due to STOP command.")
+            self._clear_setup("CE")
+            self._clear_setup("PE")
+
             self._save_state()
             
             # Close WS if not in position to save resources
@@ -466,26 +472,36 @@ class ITMMomentumStrategy:
             return
 
         # Check 3 Green Candles (Put Setup)
-        if self.pe_setup_allowed and c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open']:
-            # Only initiate if no PE setup is currently active
-            if not self.active_pe_setup:
-                log.info(f"{Fore.YELLOW}Pattern Detected: 3 Green Candles (Spot {c3['close']}). Checking Put Setup...{Style.RESET_ALL}")
+        # Strict Trend Check: Higher Lows for Green sequence (Clean uptrend)
+        is_clean_uptrend = c2['low'] >= c1['low'] and c3['low'] >= c2['low']
+        
+        if self.pe_setup_allowed and not self.current_pe_setup_discard and c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and is_clean_uptrend:
+            is_continuation = False
+            if self.active_pe_setup:
+                # If previous candle was also Green, it's a continuation.
+                if c0 and c0['close'] > c0['open']:
+                    is_continuation = True
+                    log.info(f"  Continuation of Green leg. Ignoring update.")
+            
+            if not is_continuation:
+                # New PE Setup detected (or replacing old one)
                 self._initiate_setup("PE", c1, c3['close'])
-        # If the pattern of 3 green candles is broken, clear any active PE setup
-        elif self.active_pe_setup:
-            log.info("PE Setup invalidated (Pattern broken).")
-            self._clear_setup("PE")
 
         # Check 3 Red Candles (Call Setup)
-        elif self.ce_setup_allowed and c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open']:
-            # Only initiate if no CE setup is currently active
-            if not self.active_ce_setup:
-                log.info(f"{Fore.YELLOW}Pattern Detected: 3 Red Candles (Spot {c3['close']}). Checking Call Setup...{Style.RESET_ALL}")
+        # Strict Trend Check: Lower Highs for Red sequence (Clean downtrend)
+        is_clean_downtrend = c2['high'] <= c1['high'] and c3['high'] <= c2['high']
+        
+        if self.ce_setup_allowed and not self.current_ce_setup_discard and c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and is_clean_downtrend:
+            is_continuation = False
+            if self.active_ce_setup:
+                # If previous candle was also Red, it's a continuation.
+                if c0 and c0['close'] < c0['open']:
+                    is_continuation = True
+                    log.info(f"  Continuation of Red leg. Ignoring update.")
+
+            if not is_continuation:
+                # New CE Setup detected (or replacing old one)
                 self._initiate_setup("CE", c1, c3['close'])
-        # If the pattern of 3 red candles is broken, clear any active CE setup
-        elif self.active_ce_setup:
-            log.info("CE Setup invalidated (Pattern broken).")
-            self._clear_setup("CE")
 
     def _initiate_setup(self, setup_type: str, ref_candle: dict, current_spot: float):
         """Prepares the setup triggers."""
@@ -515,6 +531,12 @@ class ITMMomentumStrategy:
         # --- HARDCORE ALGO: Pre-place Stop Loss Limit Order ---
         if not self.simulate_orders:
             try:
+                # If replacing an existing setup of same type, cancel old order first
+                if setup_type == "PE" and self.active_pe_setup:
+                    self._cancel_setup_order(self.active_pe_setup)
+                elif setup_type == "CE" and self.active_ce_setup:
+                    self._cancel_setup_order(self.active_ce_setup)
+
                 limit_price = round(opt_high + self.slippage_buffer, 1)
                 trigger_price = round(opt_high, 1)
                 
@@ -706,22 +728,29 @@ class ITMMomentumStrategy:
     def _execute_exit(self, ltp: float, reason: str):
         pos = self.position_info
         contract = pos['contract']
-        pnl = (ltp - pos['entry_price']) * pos['qty']
-        
-        exit_time_str = datetime.now().strftime("%H:%M:%S")
-        log.info(f"{Fore.MAGENTA}*** EXIT TRIGGERED ({reason}) at {exit_time_str} *** {contract.symbol} @ {ltp} | PNL: {pnl:.2f}{Style.RESET_ALL}")
-        
-        # Log trade to CSV for Dashboard
-        max_points = pos.get('highest_ltp', pos['entry_price']) - pos['entry_price']
-        self._log_trade(contract, pos['entry_price'], ltp, pnl, reason, max_points)
+        exit_price = ltp
         
         if not self.simulate_orders:
             try:
-                self.api.place_order(contract.symbol, contract.token, pos['qty'], "SELL", product_type="INTRADAY")
+                order_id = self.api.place_order(contract.symbol, contract.token, pos['qty'], "SELL", product_type="INTRADAY")
+                log.info(f"Exit Order Placed: {order_id}")
+                filled_price = self._wait_for_fill(order_id)
+                if filled_price:
+                    exit_price = filled_price
             except Exception as e:
                 log.error(f"Exit order failed: {e}")
 
+        pnl = (exit_price - pos['entry_price']) * pos['qty']
+        
+        exit_time_str = datetime.now().strftime("%H:%M:%S")
+        log.info(f"{Fore.MAGENTA}*** EXIT TRIGGERED ({reason}) at {exit_time_str} *** {contract.symbol} @ {exit_price} | PNL: {pnl:.2f}{Style.RESET_ALL}")
+        
+        # Log trade to CSV for Dashboard
+        max_points = pos.get('highest_ltp', pos['entry_price']) - pos['entry_price']
+        self._log_trade(contract, pos['entry_price'], exit_price, pnl, reason, max_points)
+
         self.closed_pnl += pnl
+        log.info(f"💰 Total Closed PnL: {self.closed_pnl:.2f}")
         self.in_position = False
         
         # --- Profit Maximization & Protection Logic ---
@@ -773,7 +802,7 @@ class ITMMomentumStrategy:
             prefix = "[SIM] " if self.simulate_orders else ""
             msg = f"{emoji} <b>{prefix}EXIT: {self.index_name} ({reason})</b>\n" \
                   f"Symbol: {contract.symbol}\n" \
-                  f"Exit Price: {ltp}\n" \
+                  f"Exit Price: {exit_price}\n" \
                   f"PnL: {pnl:.2f}"
             self.telegram.send_message(msg)
         self._save_state()
@@ -808,13 +837,11 @@ class ITMMomentumStrategy:
         # Check for discard requests (regardless of position state, but mostly for armed setups)
         if self.current_ce_setup_discard and self.active_ce_setup:
             log.warning(f"{Fore.YELLOW}CONFIG REQUEST: Discarding active CE setup {self.active_ce_setup['contract'].symbol} as requested.{Style.RESET_ALL}")
-            self.active_ce_setup = None
-            self._save_state()
+            self._clear_setup("CE")
 
         if self.current_pe_setup_discard and self.active_pe_setup:
             log.warning(f"{Fore.YELLOW}CONFIG REQUEST: Discarding active PE setup {self.active_pe_setup['contract'].symbol} as requested.{Style.RESET_ALL}")
-            self.active_pe_setup = None
-            self._save_state()
+            self._clear_setup("PE")
 
         now = datetime.now()
         
@@ -857,7 +884,19 @@ class ITMMomentumStrategy:
                     spot_cond = (spot_ltp < setup['spot_trigger']) if setup['type'] == 'PE' else (spot_ltp > setup['spot_trigger'])
                     opt_cond = opt_ltp > setup['opt_trigger']
                     
-                    if spot_cond and opt_cond:
+                    # Determine if we should check for execution
+                    trigger_met = False
+                    if self.simulate_orders:
+                        # Simulation: Strict adherence to strategy (Spot AND Option must trigger)
+                        if spot_cond and opt_cond:
+                            trigger_met = True
+                    else:
+                        # Live: The order is physically on the Option. If Option triggers, the broker executes.
+                        # We MUST check order status if Option triggers, regardless of Spot.
+                        if opt_cond:
+                            trigger_met = True
+
+                    if trigger_met:
                         log.info(f"{Fore.YELLOW}Local Trigger Detected: {setup['type']} Spot={spot_ltp} Opt={opt_ltp} > {setup['opt_trigger']}{Style.RESET_ALL}")
                         
                         if self.simulate_orders:

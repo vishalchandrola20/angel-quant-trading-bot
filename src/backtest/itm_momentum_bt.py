@@ -284,7 +284,10 @@ class ITMMomentumBacktest:
                 log.info(f"Scan {current_ts.time()} | Candles: {c1_ts.time()}{fmt_c(c1)} {c2_ts.time()}{fmt_c(c2)} {c3_ts.time()}{fmt_c(c3)}")
 
                 # Put Setup: 3 Green
-                if self.pe_setup_allowed and c1.close > c1.open and c2.close > c2.open and c3.close > c3.open:
+                is_clean_uptrend = c1.low <= c2.low <= c3.low
+                is_clean_downtrend = c1.high >= c2.high >= c3.high
+
+                if self.pe_setup_allowed and c1.close > c1.open and c2.close > c2.open and c3.close > c3.open and is_clean_uptrend:
                     is_continuation = False
                     if active_pe_setup:
                         # If previous candle was also Green, it's a continuation. Keep original setup.
@@ -311,7 +314,7 @@ class ITMMomentumBacktest:
                             log.warning(f"  Could not setup PE: {e}")
 
                 # Call Setup: 3 Red
-                elif self.ce_setup_allowed and c1.close < c1.open and c2.close < c2.open and c3.close < c3.open:
+                elif self.ce_setup_allowed and c1.close < c1.open and c2.close < c2.open and c3.close < c3.open and is_clean_downtrend:
                     is_continuation = False
                     if active_ce_setup:
                         # If previous candle was also Red, it's a continuation. Keep original setup.
