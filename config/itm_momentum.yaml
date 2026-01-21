@@ -1,15 +1,15 @@
 NIFTY:
   lot_size: 65
   num_lots: 1
-  sl_points: 15
-  target_points: 25
+  sl_points: 14.70
+  target_points: 45
   slippage_buffer: 0.5
   profit_lock_threshold: 3000
   profit_drawdown_limit: 1500
   trailing_sl_tiers:
     - activation: 12
       distance: 15
-    - activation: 20
+    - activation: 18
       distance: 5
     - activation: 25
       distance: 3
@@ -28,13 +28,17 @@ NIFTY:
 SENSEX:
   lot_size: 20
   num_lots: 1
-  sl_points: 10
-  target_points: 15
-  slippage_buffer: 1.0
+  sl_points: 48
+  target_points: 200
+  slippage_buffer: 2.0
   profit_lock_threshold: 3000
   profit_drawdown_limit: 1500
   trailing_sl_tiers:
-    - activation: 10
+    - activation: 39
+      distance: 50
+    - activation: 60
+      distance: 20
+    - activation: 84
       distance: 10
   ce_setup_allowed: true
   pe_setup_allowed: true

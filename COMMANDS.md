@@ -69,7 +69,10 @@ python -m src.live.itm_momentum_breakdown --index NIFTY --live
 ```bash
 python -m src.live.itm_momentum_breakdown --index SENSEX --live
 ```
-
+*DASHBOARD*
+```bash
+streamlit run src/dashboard.py
+```
 ---
 
 ## 🦅 Iron Condor Strategy

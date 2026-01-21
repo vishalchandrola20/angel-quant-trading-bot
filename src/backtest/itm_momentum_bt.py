@@ -299,15 +299,17 @@ class ITMMomentumBacktest:
                         strike = self._get_itm_strike(c1.low, "PE")
                         try:
                             contract = find_option(self.index_name, strike, "PE", expiry, trading_date)
-                            # Fetch Option Candle for Ref Time (C1)
+                            # Fetch Option Data from C1 (Reference) to End of Day
                             opt_df = self._fetch_candles(contract.token, contract.exchange, trading_date,
-                                                         c1_ts.strftime("%H:%M"), (c1_ts + timedelta(minutes=1)).strftime("%H:%M"))
-                            if not opt_df.empty:
-                                opt_high = opt_df.iloc[0]['high']
+                                                         c1_ts.strftime("%H:%M"), "15:30")
+                            
+                            if not opt_df.empty and c1_ts in opt_df.index:
+                                opt_high = opt_df.loc[c1_ts]['high']
                                 active_pe_setup = {
                                     "type": "PE", "contract": contract,
                                     "spot_trigger": c1.low, "opt_trigger": opt_high,
-                                    "setup_time": current_ts
+                                    "setup_time": current_ts,
+                                    "data": opt_df
                                 }
                                 log.info(f"  [PE Setup] {current_ts.time()} | Spot < {c1.low} | Opt {contract.symbol} > {opt_high}")
                         except Exception as e:
@@ -326,14 +328,17 @@ class ITMMomentumBacktest:
                         strike = self._get_itm_strike(c1.high, "CE")
                         try:
                             contract = find_option(self.index_name, strike, "CE", expiry, trading_date)
+                            # Fetch Option Data from C1 (Reference) to End of Day
                             opt_df = self._fetch_candles(contract.token, contract.exchange, trading_date,
-                                                         c1_ts.strftime("%H:%M"), (c1_ts + timedelta(minutes=1)).strftime("%H:%M"))
-                            if not opt_df.empty:
-                                opt_high = opt_df.iloc[0]['high']
+                                                         c1_ts.strftime("%H:%M"), "15:30")
+                            
+                            if not opt_df.empty and c1_ts in opt_df.index:
+                                opt_high = opt_df.loc[c1_ts]['high']
                                 active_ce_setup = {
                                     "type": "CE", "contract": contract,
                                     "spot_trigger": c1.high, "opt_trigger": opt_high,
-                                    "setup_time": current_ts
+                                    "setup_time": current_ts,
+                                    "data": opt_df
                                 }
                                 log.info(f"  [CE Setup] {current_ts.time()} | Spot > {c1.high} | Opt {contract.symbol} > {opt_high}")
                         except Exception as e:
@@ -345,48 +350,34 @@ class ITMMomentumBacktest:
             if active_ce_setup: setups_to_check.append(active_ce_setup)
 
             for setup in setups_to_check:
-                # Check current minute candle for trigger
-                spot_candle = spot_df.loc[current_ts]
-                
-                spot_triggered = False
-                if setup['type'] == "PE":
-                    if spot_candle.low < setup['spot_trigger']: spot_triggered = True
-                else:
-                    if spot_candle.high > setup['spot_trigger']: spot_triggered = True
-                
-                if spot_triggered:
-                    # Fetch Option Candle for current minute to confirm
-                    contract = setup['contract']
-                    opt_candle_df = self._fetch_candles(contract.token, contract.exchange, trading_date, 
-                                                        current_ts.strftime("%H:%M"), (current_ts + timedelta(minutes=1)).strftime("%H:%M"))
+                # Check Option Trigger directly (Proactive Order Logic)
+                # We use the pre-fetched data in setup['data']
+                if current_ts in setup['data'].index:
+                    opt_candle = setup['data'].loc[current_ts]
                     
-                    if not opt_candle_df.empty:
-                        opt_candle = opt_candle_df.iloc[0]
-                        if opt_candle.high > setup['opt_trigger']:
-                            # ENTRY CONFIRMED
-                            entry_price = max(opt_candle.open, setup['opt_trigger'])
-                            log.info(f"{Fore.GREEN}  >>> ENTRY {setup['type']} {contract.symbol} @ {entry_price} (Time: {current_ts.time()}){Style.RESET_ALL}")
-                            
-                            exit_time = self._simulate_trade(contract, entry_price, current_ts, trading_date, setup['setup_time'])
-                            last_exit_time = exit_time
-                            
-                            # Reset ALL setups on entry
-                            active_pe_setup = None
-                            active_ce_setup = None
-                            log.info(f"  Trade Exited at {exit_time.time()}. Resetting setup.")
-                            break # Stop checking other setups for this minute
-                        else:
-                            log.info(f"  Spot triggered but Opt High {opt_candle.high} <= Trigger {setup['opt_trigger']}")
-                else:
-                    log.info(f"  Spot Trigger Fail: {spot_candle.low if setup['type']=='PE' else spot_candle.high} vs {setup['spot_trigger']}")
+                    if opt_candle.high > setup['opt_trigger']:
+                        # ENTRY CONFIRMED
+                        contract = setup['contract']
+                        entry_price = max(opt_candle.open, setup['opt_trigger'])
+                        log.info(f"{Fore.GREEN}  >>> ENTRY {setup['type']} {contract.symbol} @ {entry_price} (Time: {current_ts.time()}){Style.RESET_ALL}")
+                        
+                        exit_time = self._simulate_trade(contract, entry_price, current_ts, trading_date, setup['setup_time'], full_opt_df=setup['data'])
+                        last_exit_time = exit_time
+                        
+                        # Reset ALL setups on entry
+                        active_pe_setup = None
+                        active_ce_setup = None
+                        log.info(f"  Trade Exited at {exit_time.time()}. Resetting setup.")
+                        break # Stop checking other setups for this minute
 
-    def _simulate_trade(self, contract, entry_price, entry_time, trading_date, setup_time):
+    def _simulate_trade(self, contract, entry_price, entry_time, trading_date, setup_time, full_opt_df=None):
         sl = entry_price - self.sl_points
         target = entry_price + self.target_points
         
-        # Fetch remaining data for the day for this option
-        full_opt_df = self._fetch_candles(contract.token, contract.exchange, trading_date, 
-                                          entry_time.strftime("%H:%M"), "15:30")
+        if full_opt_df is None:
+            # Fetch remaining data for the day for this option
+            full_opt_df = self._fetch_candles(contract.token, contract.exchange, trading_date, 
+                                              entry_time.strftime("%H:%M"), "15:30")
         
         # Filter for candles strictly after entry time
         rest_of_day_df = full_opt_df[full_opt_df.index > entry_time]
@@ -482,7 +473,8 @@ class ITMMomentumBacktest:
             "pnl": pnl,
             "max_potential_profit": max_potential_profit,
             "max_potential_loss": max_potential_loss,
-            "reason": exit_reason
+            "reason": exit_reason,
+            "quantity": self.lot_size * self.num_lots
         })
         return exit_time
 

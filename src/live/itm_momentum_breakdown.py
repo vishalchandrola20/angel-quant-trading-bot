@@ -616,7 +616,7 @@ class ITMMomentumStrategy:
             with open(file_path, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 if not file_exists:
-                    writer.writerow(["Date", "Index", "Symbol", "Type", "Setup Time", "Entry Time", "Entry Price", "Exit Time", "Exit Price", "PnL", "Reason", "Max Points"])
+                    writer.writerow(["Date", "Index", "Symbol", "Type", "Setup Time", "Entry Time", "Entry Price", "Exit Time", "Exit Price", "PnL", "Reason", "Max Points", "Quantity"])
                 
                 writer.writerow([
                     self.trading_date,
@@ -630,7 +630,8 @@ class ITMMomentumStrategy:
                     exit_price,
                     f"{pnl:.2f}",
                     reason,
-                    f"{max_points:.2f}"
+                    f"{max_points:.2f}",
+                    self.position_info.get("qty", 0)
                 ])
         except Exception as e:
             log.error(f"Failed to log trade to CSV: {e}")
