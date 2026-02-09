@@ -60,6 +60,7 @@ class ITMMomentumBacktest:
         self.max_daily_loss = 1500
         self.profit_lock_threshold = 3000
         self.profit_drawdown_limit = 1500
+        self.profit_protection_config = {}
         self.ce_setup_allowed = True
         self.pe_setup_allowed = True
         self.current_ce_setup_discard = False
@@ -82,6 +83,7 @@ class ITMMomentumBacktest:
                 self.max_daily_loss = idx_config.get("max_daily_loss", 1500)
                 self.profit_lock_threshold = idx_config.get("profit_lock_threshold", 3000)
                 self.profit_drawdown_limit = idx_config.get("profit_drawdown_limit", 1500)
+                self.profit_protection_config = idx_config.get("profit_protection", {})
                 self.trailing_sl_tiers = idx_config.get("trailing_sl_tiers", [])
                 if not self.trailing_sl_tiers:
                     act = idx_config.get("trailing_activation_points", 10)
@@ -226,8 +228,12 @@ class ITMMomentumBacktest:
                 if current_day_pnl > peak_day_pnl:
                     peak_day_pnl = current_day_pnl
                 
-                if peak_day_pnl - current_day_pnl >= self.profit_drawdown_limit:
-                    log.info(f"Skipping {current_ts.time()} (Profit protection hit: Peak {peak_day_pnl:.2f}, Current {current_day_pnl:.2f})")
+                current_drawdown_limit = self.profit_drawdown_limit
+                if self.profit_protection_config:
+                    current_drawdown_limit = self.profit_protection_config.get('drawdown_limit', current_drawdown_limit)
+                
+                if peak_day_pnl - current_day_pnl >= current_drawdown_limit:
+                    log.info(f"Skipping {current_ts.time()} (Profit protection hit: Peak {peak_day_pnl:.2f}, Current {current_day_pnl:.2f}, Limit {current_drawdown_limit})")
                     break
             elif current_day_pnl >= self.profit_lock_threshold:
                 profit_locking_active = True
@@ -361,7 +367,7 @@ class ITMMomentumBacktest:
                         entry_price = max(opt_candle.open, setup['opt_trigger'])
                         log.info(f"{Fore.GREEN}  >>> ENTRY {setup['type']} {contract.symbol} @ {entry_price} (Time: {current_ts.time()}){Style.RESET_ALL}")
                         
-                        exit_time = self._simulate_trade(contract, entry_price, current_ts, trading_date, setup['setup_time'], full_opt_df=setup['data'])
+                        exit_time = self._simulate_trade(contract, entry_price, current_ts, trading_date, setup['setup_time'], full_opt_df=setup['data'], scalp_mode=profit_locking_active)
                         last_exit_time = exit_time
                         
                         # Reset ALL setups on entry
@@ -370,9 +376,18 @@ class ITMMomentumBacktest:
                         log.info(f"  Trade Exited at {exit_time.time()}. Resetting setup.")
                         break # Stop checking other setups for this minute
 
-    def _simulate_trade(self, contract, entry_price, entry_time, trading_date, setup_time, full_opt_df=None):
-        sl = entry_price - self.sl_points
-        target = entry_price + self.target_points
+    def _simulate_trade(self, contract, entry_price, entry_time, trading_date, setup_time, full_opt_df=None, scalp_mode=False):
+        current_sl_pts = self.sl_points
+        current_target_pts = self.target_points
+        
+        is_scalp_active = scalp_mode and self.profit_protection_config and self.profit_protection_config.get('enable_scalp_mode', True)
+        
+        if is_scalp_active:
+            current_sl_pts = self.profit_protection_config.get('sl_points', current_sl_pts)
+            current_target_pts = self.profit_protection_config.get('target_points', current_target_pts)
+            
+        sl = entry_price - current_sl_pts
+        target = entry_price + current_target_pts
         
         if full_opt_df is None:
             # Fetch remaining data for the day for this option
@@ -395,10 +410,51 @@ class ITMMomentumBacktest:
         highest_price_during_trade = entry_price
         max_potential_profit = 0.0
         
+        prev_open = entry_price # Track previous candle open for trailing
+        
         # Iterate subsequent candles
         for ts, row in rest_of_day_df.iterrows():
+            # --- Trailing SL Logic (Run at start of candle to set SL for this minute) ---
+            if not is_scalp_active:
+                peak_pts = highest_price_during_trade - entry_price
+                
+                active_tier = None
+                for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
+                    if peak_pts >= tier['activation']:
+                        active_tier = tier
+                        break
+                
+                if active_tier:
+                    new_sl = sl # Start with current SL
+                    if 'distance' in active_tier:
+                        trail_sl = highest_price_during_trade - active_tier['distance']
+                        new_sl = max(new_sl, trail_sl)
+                    elif 'fix_sl' in active_tier:
+                        fix_sl_level = entry_price + active_tier['fix_sl']
+                        new_sl = max(new_sl, fix_sl_level)
+                    elif active_tier.get('trail_type') == 'candle_open':
+                        # Trail based on Previous Candle Open (prev_open is from the candle before 'row')
+                        prev_ts_str = (ts - timedelta(minutes=1)).strftime('%H:%M')
+                        
+                        min_dist = active_tier.get('min_distance', 0)
+                        fallback_buffer = active_tier.get('fallback_sl_buffer')
+                        
+                        if (highest_price_during_trade - prev_open) >= min_dist:
+                            potential_sl = max(new_sl, prev_open)
+                            log.info(f"Candle Open Trail: Prev Open={prev_open} (Time: {prev_ts_str}) | Existing SL={new_sl} -> Result SL={potential_sl}")
+                            new_sl = potential_sl
+                        elif fallback_buffer is not None:
+                            fallback_sl = highest_price_during_trade - fallback_buffer
+                            potential_sl = max(new_sl, fallback_sl)
+                            log.info(f"Candle Open Fallback: Buffer Not Met. Using Fallback SL={fallback_sl} | Existing SL={new_sl} -> Result SL={potential_sl}")
+                            new_sl = potential_sl
+                    
+                    if new_sl > sl:
+                        sl = new_sl
+
             # 1. Check Exit against SL (Conservative: Check Low first)
             if row.low <= sl:
+                log.info(f"🛑 SL Hit at {ts.time()}: Low {row.low} <= SL {sl}")
                 exit_price = sl
                 exit_reason = "SL"
                 exit_time = ts
@@ -430,22 +486,12 @@ class ITMMomentumBacktest:
                     max_potential_profit = peak_price - entry_price
                 break
             
-            # 3. Update High and Trailing SL for NEXT candle
+            # 3. Update High
             if row.high > highest_price_during_trade:
                 highest_price_during_trade = row.high
                 
-                peak_pts = highest_price_during_trade - entry_price
-                
-                active_distance = None
-                for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
-                    if peak_pts >= tier['activation']:
-                        active_distance = tier['distance']
-                        break
-                
-                if active_distance is not None:
-                    trail_sl = highest_price_during_trade - active_distance
-                    if trail_sl > sl:
-                        sl = trail_sl
+            # Update prev_open for next iteration
+            prev_open = row.open
         
         if exit_time is None:
             # EOD Exit

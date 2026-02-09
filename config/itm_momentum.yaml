@@ -1,19 +1,29 @@
 NIFTY:
   lot_size: 65
   num_lots: 1
-  sl_points: 14.70
+  max_daily_loss: 3500
+  sl_points: 15
   target_points: 45
   slippage_buffer: 0.5
   profit_lock_threshold: 3000
-  profit_drawdown_limit: 1500
+  profit_protection:
+    enable_scalp_mode: true
+    sl_points: 6
+    target_points: 7
+    drawdown_limit: 1000
   trailing_sl_tiers:
-    - activation: 12
-      distance: 15
-    - activation: 18
-      distance: 5
-    - activation: 25
-      distance: 3
-  ce_setup_allowed: true
+    - activation: 6
+      fix_sl: -12
+    - activation: 8
+      fix_sl: -8
+    - activation: 10
+      fix_sl: -2
+    - activation: 13
+      distance: 6
+    - activation: 20
+      trail_type: candle_open
+      min_distance: 3
+  ce_setup_allowed: false
   pe_setup_allowed: true
   current_ce_setup_discard: false
   current_pe_setup_discard: false
@@ -28,18 +38,30 @@ NIFTY:
 SENSEX:
   lot_size: 20
   num_lots: 1
-  sl_points: 48
-  target_points: 200
-  slippage_buffer: 2.0
+  max_daily_loss: 3500
+  sl_points: 50
+  target_points: 400
+  slippage_buffer: 4.0
   profit_lock_threshold: 3000
-  profit_drawdown_limit: 1500
+  profit_protection:
+    enable_scalp_mode: false
+    sl_points: 20
+    target_points: 25
+    drawdown_limit: 1000
   trailing_sl_tiers:
-    - activation: 39
-      distance: 50
-    - activation: 60
-      distance: 20
-    - activation: 84
-      distance: 10
+    - activation: 10
+      fix_sl: -40
+    - activation: 20
+      fix_sl: -30
+    - activation: 25
+      fix_sl: -20
+    - activation: 40
+      fix_sl: 0
+    - activation: 50
+  #    distance: 20
+      trail_type: candle_open
+      min_distance: 20
+      fallback_sl_buffer: 20
   ce_setup_allowed: true
   pe_setup_allowed: true
   current_ce_setup_discard: false

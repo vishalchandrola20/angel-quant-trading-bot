@@ -107,6 +107,7 @@ class ITMMomentumStrategy:
         self.profit_lock_threshold = 3000
         self.profit_drawdown_limit = 1500
         self.profit_locking_active = False
+        self.profit_protection_config = {}
         self.peak_closed_pnl = 0.0
         
         # State Persistence
@@ -150,6 +151,7 @@ class ITMMomentumStrategy:
                     self.slippage_buffer = idx_config.get("slippage_buffer", 0.5)
                     self.profit_lock_threshold = idx_config.get("profit_lock_threshold", 3000)
                     self.profit_drawdown_limit = idx_config.get("profit_drawdown_limit", 1500)
+                    self.profit_protection_config = idx_config.get("profit_protection", {})
                     
                     self.trailing_sl_tiers = idx_config.get("trailing_sl_tiers", [])
                     if not self.trailing_sl_tiers:
@@ -358,29 +360,52 @@ class ITMMomentumStrategy:
             msg = f"ℹ️ <b>STATUS REPORT [{mode}]</b>\nState: {status}\nActivity: {pos_status}\nClosed PnL: {self.closed_pnl:.2f}"
             if self.telegram: self.telegram.send_message(msg)
 
-    def _cancel_setup_order(self, setup: dict):
-        """Cancels the pending SL-L order associated with a setup."""
+    def _cancel_setup_order(self, setup: dict) -> bool:
+        """Cancels the pending SL-L order associated with a setup. Returns True if successful."""
         if not setup or 'order_id' not in setup or not setup['order_id']:
-            return
+            return True
             
         order_id = setup['order_id']
-        log.info(f"Cancelling pending setup order: {order_id}")
         
         try:
+            # Fetch status first to ensure we know what we are cancelling
+            status_resp = self.api.get_order_status(order_id)
+            current_status = status_resp.get('status', 'UNKNOWN') if status_resp else 'UNKNOWN'
+            
+            log.info(f"Cancelling pending setup order: {order_id} | Current Status: {current_status}")
+            
+            if current_status == 'complete':
+                log.error(f"⚠️ CRITICAL: Setup order {order_id} was FILLED! Cannot cancel.")
+                return False
+            elif current_status in ['cancelled', 'rejected']:
+                log.info(f"Order {order_id} is already {current_status}.")
+                return True
+            
             # SL-L orders are placed with STOPLOSS variety
-            self.api.connection.cancelOrder(order_id, variety="STOPLOSS")
+            response = self.api.connection.cancelOrder(order_id, variety="STOPLOSS")
+            log.info(f"✅ Cancel Response for {order_id}: {response}")
+            return True
         except Exception as e:
             log.error(f"Failed to cancel setup order {order_id}: {e}")
+            return False
 
     def _clear_setup(self, setup_type: str):
         """Clears the setup and cancels any pending orders."""
         if setup_type == "PE":
             if self.active_pe_setup:
                 if not self.simulate_orders: self._cancel_setup_order(self.active_pe_setup)
+                # Remove token from subscription list
+                token = self.active_pe_setup['contract'].token
+                if token in self.subscribed_tokens:
+                    self.subscribed_tokens.remove(token)
                 self.active_pe_setup = None
         elif setup_type == "CE":
             if self.active_ce_setup:
                 if not self.simulate_orders: self._cancel_setup_order(self.active_ce_setup)
+                # Remove token from subscription list
+                token = self.active_ce_setup['contract'].token
+                if token in self.subscribed_tokens:
+                    self.subscribed_tokens.remove(token)
                 self.active_ce_setup = None
         self._save_state()
 
@@ -453,6 +478,18 @@ class ITMMomentumStrategy:
                 time_module.sleep(1)
         
         log.error(f"Failed to fetch option high for {contract.symbol} after {max_retries} attempts.")
+        return None
+
+    def _get_prev_candle_open(self, contract) -> tuple[float, datetime] | None:
+        """Fetches the previous completed candle's open price and time for the option."""
+        try:
+            # Fetch last 2 completed candles
+            candles = self._fetch_last_n_candles(contract.token, contract.exchange, 2)
+            if candles:
+                # The last element is the most recent completed candle
+                return candles[-1]['open'], candles[-1]['ts']
+        except Exception as e:
+            log.warning(f"Failed to fetch prev candle open: {e}")
         return None
 
     def _check_for_setup(self):
@@ -533,9 +570,13 @@ class ITMMomentumStrategy:
             try:
                 # If replacing an existing setup of same type, cancel old order first
                 if setup_type == "PE" and self.active_pe_setup:
-                    self._cancel_setup_order(self.active_pe_setup)
+                    if not self._cancel_setup_order(self.active_pe_setup):
+                        log.warning("Skipping PE setup update: Could not cancel existing order. Retrying next tick.")
+                        return
                 elif setup_type == "CE" and self.active_ce_setup:
-                    self._cancel_setup_order(self.active_ce_setup)
+                    if not self._cancel_setup_order(self.active_ce_setup):
+                        log.warning("Skipping CE setup update: Could not cancel existing order. Retrying next tick.")
+                        return
 
                 limit_price = round(opt_high + self.slippage_buffer, 1)
                 trigger_price = round(opt_high, 1)
@@ -563,8 +604,17 @@ class ITMMomentumStrategy:
                 return # Don't arm setup if order failed
         
         if setup_type == "PE":
+            # If replacing an existing setup, remove the old token from subscriptions
+            if self.active_pe_setup and self.active_pe_setup['contract'].token != contract.token:
+                old_token = self.active_pe_setup['contract'].token
+                if old_token in self.subscribed_tokens:
+                    self.subscribed_tokens.remove(old_token)
             self.active_pe_setup = setup_data
         else:
+            if self.active_ce_setup and self.active_ce_setup['contract'].token != contract.token:
+                old_token = self.active_ce_setup['contract'].token
+                if old_token in self.subscribed_tokens:
+                    self.subscribed_tokens.remove(old_token)
             self.active_ce_setup = setup_data
         
         # Subscribe to the option token for live monitoring
@@ -693,12 +743,21 @@ class ITMMomentumStrategy:
         else:
             log.info(f"{Fore.GREEN}*** LIVE ENTRY CONFIRMED *** {contract.symbol} @ {filled_price} | Order: {setup.get('order_id')}{Style.RESET_ALL}")
         
+        # Determine SL/Target based on Profit Protection Mode
+        current_sl_pts = self.sl_points
+        current_target_pts = self.target_points
+        
+        if self.profit_locking_active and self.profit_protection_config and self.profit_protection_config.get('enable_scalp_mode', True):
+            current_sl_pts = self.profit_protection_config.get('sl_points', current_sl_pts)
+            current_target_pts = self.profit_protection_config.get('target_points', current_target_pts)
+            log.info(f"🛡️ Profit Protection Mode Active: Using Scalp SL={current_sl_pts}, Target={current_target_pts}")
+
         self.in_position = True
         self.position_info = {
             "contract": contract,
             "entry_price": filled_price,
-            "sl": filled_price - self.sl_points,
-            "target": filled_price + self.target_points,
+            "sl": filled_price - current_sl_pts,
+            "target": filled_price + current_target_pts,
             "qty": self.quantity,
             "highest_ltp": filled_price,
             "entry_time": datetime.now().strftime("%H:%M:%S"),
@@ -771,13 +830,18 @@ class ITMMomentumStrategy:
                 log.info(f"{Fore.GREEN}New Peak PnL: {self.peak_closed_pnl:.2f}{Style.RESET_ALL}")
             
             # Check for drawdown from peak
+            current_drawdown_limit = self.profit_drawdown_limit
+            if self.profit_protection_config:
+                current_drawdown_limit = self.profit_protection_config.get('drawdown_limit', current_drawdown_limit)
+            
             drawdown = self.peak_closed_pnl - self.closed_pnl
-            if drawdown >= self.profit_drawdown_limit:
-                log.warning(f"{Fore.RED}Profit drawdown limit reached. Peak: {self.peak_closed_pnl:.2f}, Current: {self.closed_pnl:.2f}, Drawdown: {drawdown:.2f} >= {self.profit_drawdown_limit}. Stopping trading.{Style.RESET_ALL}")
+            
+            if drawdown >= current_drawdown_limit:
+                log.warning(f"{Fore.RED}Profit drawdown limit reached. Peak: {self.peak_closed_pnl:.2f}, Current: {self.closed_pnl:.2f}, Drawdown: {drawdown:.2f} >= {current_drawdown_limit}. Stopping trading.{Style.RESET_ALL}")
                 self.is_paused = True
                 if self.telegram:
                     prefix = "[SIM] " if self.simulate_orders else ""
-                    self.telegram.send_message(f"🛑 <b>{prefix}Profit Protection Hit</b>\nTrading stopped.\nPeak PnL: {self.peak_closed_pnl:.2f}\nCurrent PnL: {self.closed_pnl:.2f}")
+                    self.telegram.send_message(f"🛑 <b>{prefix}Profit Protection Hit</b>\nTrading stopped.\nPeak PnL: {self.peak_closed_pnl:.2f}\nCurrent PnL: {self.closed_pnl:.2f}\nLimit: {current_drawdown_limit}")
 
         # Check for max daily loss
         if self.closed_pnl <= -self.max_daily_loss:
@@ -813,24 +877,40 @@ class ITMMomentumStrategy:
         if self._load_config() and self.in_position:
             entry = self.position_info['entry_price']
 
-            self.position_info['target'] = entry + self.target_points
+            # Determine parameters based on Profit Protection Mode
+            current_sl_pts = self.sl_points
+            current_target_pts = self.target_points
+            
+            is_scalp_mode = self.profit_locking_active and self.profit_protection_config and self.profit_protection_config.get('enable_scalp_mode', True)
+
+            if is_scalp_mode:
+                current_sl_pts = self.profit_protection_config.get('sl_points', current_sl_pts)
+                current_target_pts = self.profit_protection_config.get('target_points', current_target_pts)
+
+            self.position_info['target'] = entry + current_target_pts
             
             # Recalculate SL based on new config and current high
             highest = self.position_info.get('highest_ltp', entry)
             peak_pts = highest - entry
             
-            new_sl = entry - self.sl_points # Base SL
+            new_sl = entry - current_sl_pts # Base SL
             
-            # Find applicable tier
-            active_distance = None
-            for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
-                if peak_pts >= tier['activation']:
-                    active_distance = tier['distance']
-                    break
-            
-            if active_distance is not None:
-                trail_sl = highest - active_distance
-                new_sl = max(new_sl, trail_sl)
+            if not is_scalp_mode:
+                # Find applicable tier
+                active_tier = None
+                for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
+                    if peak_pts >= tier['activation']:
+                        active_tier = tier
+                        break
+                
+                if active_tier:
+                    if 'distance' in active_tier:
+                        trail_sl = highest - active_tier['distance']
+                        new_sl = max(new_sl, trail_sl)
+                    elif 'fix_sl' in active_tier:
+                        fix_sl_level = entry + active_tier['fix_sl']
+                        new_sl = max(new_sl, fix_sl_level)
+                    # Candle open trail is handled in the main loop below, so we skip it here to avoid API calls
             
             self.position_info['sl'] = new_sl
             log.info(f"Position Limits Updated: Target {self.position_info['target']:.2f} | SL {self.position_info['sl']:.2f}")
@@ -858,8 +938,18 @@ class ITMMomentumStrategy:
 
         # 2. Minute-based Candle Check (Only runs once per minute)
         if now.minute != self.last_candle_check_minute:
-            # Only look for new setups if we are NOT in a position
-            if not self.in_position and not self.is_paused and self._is_trading_allowed(now.time()):
+            if self.in_position:
+                # Only fetch candle data if we actually have a tier that needs it
+                uses_candle_trail = any(t.get('trail_type') == 'candle_open' for t in self.trailing_sl_tiers)
+                
+                if uses_candle_trail:
+                    # Optimization: Fetch candle data once per minute for trailing logic
+                    result = self._get_prev_candle_open(self.position_info['contract'])
+                    if result:
+                        self.position_info['prev_candle_open'] = result[0]
+                        self.position_info['prev_candle_ts'] = result[1]
+                        log.info(f"Updated Position Candle Data: Prev Open={result[0]} at {result[1].strftime('%H:%M')}")
+            elif not self.is_paused and self._is_trading_allowed(now.time()):
                 self._check_for_setup()
             self.last_candle_check_minute = now.minute
 
@@ -898,7 +988,7 @@ class ITMMomentumStrategy:
                             trigger_met = True
 
                     if trigger_met:
-                        log.info(f"{Fore.YELLOW}Local Trigger Detected: {setup['type']} Spot={spot_ltp} Opt={opt_ltp} > {setup['opt_trigger']}{Style.RESET_ALL}")
+                        log.info(f"{Fore.YELLOW}Local Trigger Detected: {setup['type']} ({setup['contract'].symbol}) Spot={spot_ltp} Opt={opt_ltp} > {setup['opt_trigger']}{Style.RESET_ALL}")
                         
                         if self.simulate_orders:
                             # In sim, we must wait/verify fill at the trigger price
@@ -934,20 +1024,60 @@ class ITMMomentumStrategy:
                     state_changed = True
                 
                 # Trailing SL Logic
-                peak_pts = pos['highest_ltp'] - pos['entry_price']
+                is_scalp_mode = self.profit_locking_active and self.profit_protection_config and self.profit_protection_config.get('enable_scalp_mode', True)
 
-                active_distance = None
-                for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
-                    if peak_pts >= tier['activation']:
-                        active_distance = tier['distance']
-                        break
-                
-                if active_distance is not None:
-                    new_sl = pos['highest_ltp'] - active_distance
-                    if new_sl > pos['sl']:
-                        pos['sl'] = new_sl
-                        log.info(f"{Fore.MAGENTA}Trailing SL Updated: {new_sl:.2f} (Peak Pts: {peak_pts:.2f}){Style.RESET_ALL}")
-                        state_changed = True
+                if not is_scalp_mode:
+                    peak_pts = pos['highest_ltp'] - pos['entry_price']
+
+                    active_tier = None
+                    for tier in sorted(self.trailing_sl_tiers, key=lambda x: x['activation'], reverse=True):
+                        if peak_pts >= tier['activation']:
+                            active_tier = tier
+                            break
+                    
+                    if active_tier:
+                        new_sl = pos['sl'] # Start with current SL
+                        if 'distance' in active_tier:
+                            trail_sl = pos['highest_ltp'] - active_tier['distance']
+                            new_sl = max(new_sl, trail_sl)
+                        elif 'fix_sl' in active_tier:
+                            fix_sl_level = pos['entry_price'] + active_tier['fix_sl']
+                            new_sl = max(new_sl, fix_sl_level)
+                        elif active_tier.get('trail_type') == 'candle_open':
+                            # Trail based on Previous Candle Open
+                            # Use cached value to avoid API spam
+                            prev_open = pos.get('prev_candle_open')
+                            prev_ts = pos.get('prev_candle_ts')
+                            
+                            # Fallback if cache empty (e.g. right after entry)
+                            if prev_open is None:
+                                 result = self._get_prev_candle_open(pos['contract'])
+                                 if result:
+                                     prev_open, prev_ts = result
+                                     pos['prev_candle_open'] = prev_open
+                                     pos['prev_candle_ts'] = prev_ts
+                            
+                            if prev_open is not None:
+                                # Check for minimum distance constraint (Buffer)
+                                min_dist = active_tier.get('min_distance', 0)
+                                current_high = pos.get('highest_ltp', pos['entry_price'])
+                                fallback_buffer = active_tier.get('fallback_sl_buffer')
+                                
+                                if (current_high - prev_open) >= min_dist:
+                                    potential_sl = max(new_sl, prev_open)
+                                    log.info(f"Candle Open Trail (Peak {peak_pts:.2f}): Prev Open={prev_open} (Time: {prev_ts.strftime('%H:%M') if prev_ts else 'N/A'}) | Existing SL={new_sl} -> Result SL={potential_sl}")
+                                    new_sl = potential_sl
+                                elif fallback_buffer is not None:
+                                    # Fallback: Trail by fixed buffer from high if candle open is too close
+                                    fallback_sl = current_high - fallback_buffer
+                                    potential_sl = max(new_sl, fallback_sl)
+                                    log.info(f"Candle Open Fallback (Peak {peak_pts:.2f}): Buffer Not Met. Using Fallback SL={fallback_sl} | Existing SL={new_sl} -> Result SL={potential_sl}")
+                                    new_sl = potential_sl
+
+                        if new_sl > pos['sl']:
+                            pos['sl'] = new_sl
+                            log.info(f"{Fore.MAGENTA}Trailing SL Updated: {new_sl:.2f} (Peak Pts: {peak_pts:.2f}){Style.RESET_ALL}")
+                            state_changed = True
                 
                 if state_changed:
                     self._save_state()
@@ -965,6 +1095,10 @@ class ITMMomentumStrategy:
         try:
             token = str(payload.get("token") or payload.get("tk"))
             if not token: return
+            
+            # Ignore ticks for tokens we are no longer interested in
+            if token not in self.subscribed_tokens:
+                return
 
             ltp = float(payload.get("last_traded_price") or payload.get("ltp") or payload.get("lp"))
             exchange_type = payload.get("exchange_type")
